@@ -118,6 +118,7 @@ NUMERIC_KEYWORDS = {"salary", "rate", "hours", "amount", "percent", "percentage"
 DATE_KEYWORDS = {"date", "dob", "birth", "effective"}
 ZIP_KEYWORDS = {"zip", "zipcode", "postal"}
 PHONE_KEYWORDS = {"phone", "mobile"}
+NAME_KEYWORDS = {"name"}
 
 ROUTING_KEYWORDS = {"routing"}
 ACCOUNTNUM_KEYWORDS = {"account number"}
@@ -141,6 +142,29 @@ def norm_zip_first5(x):
         s = s.zfill(5)
     return s[:5]
 
+
+def normalize_person_name(x: str) -> str:
+    """Normalize a person's name so 'Last, First' equals 'First Last'."""
+    s = norm_blank(x)
+    if s == "":
+        return ""
+    s = str(s).strip().replace("\u00A0", " ")
+    # Handle "Last, First [Middle] [, Suffix]" formats
+    if "," in s:
+        parts = [p.strip() for p in s.split(",") if p.strip()]
+        if len(parts) >= 2:
+            # parts[0]=last, parts[1]=first...
+            s = " ".join([parts[1], parts[0]] + parts[2:])
+    # Remove punctuation (keep letters/numbers/spaces)
+    s = re.sub(r"[^A-Za-z0-9\s]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    if s == "":
+        return ""
+    tokens = [t for t in s.split(" ") if t]
+    # Order-insensitive compare: sort tokens
+    tokens = sorted(tokens, key=lambda z: z.casefold())
+    return " ".join(tokens).casefold()
+
 def norm_value(x, field_name: str):
     f = norm_colname(field_name).casefold()
     x = norm_blank(x)
@@ -163,6 +187,10 @@ def norm_value(x, field_name: str):
 
     if any(k in f for k in DATE_KEYWORDS):
         return try_parse_date(x)
+
+    # Names: treat 'Last, First' as equal to 'First Last'
+    if any(k in f for k in NAME_KEYWORDS):
+        return normalize_person_name(x)
 
     if any(k in f for k in NUMERIC_KEYWORDS):
         if isinstance(x, (int, float, np.integer, np.floating)):
