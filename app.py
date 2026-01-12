@@ -149,7 +149,8 @@ def normalize_person_name(x: str) -> str:
     Examples:
       - "Young, Roscoe Robert" -> "roscoe young"
       - "Roscoe Young"         -> "roscoe young"
-      - "Clark, Dominique Eileen" -> "dominique clark"
+      - "Bell, Ronald"         -> "ronald bell"
+      - "Ronald Bell"          -> "ronald bell"
     Middle names/initials/suffixes are ignored.
     """
     s = norm_blank(x)
@@ -159,14 +160,11 @@ def normalize_person_name(x: str) -> str:
     s = str(s).strip().replace("\u00A0", " ")
 
     def _clean_tokens(txt: str):
-        txt = re.sub(r"[^A-Za-z0-9\s]", " ", txt)     # remove punctuation
+        txt = re.sub(r"[^A-Za-z0-9\s]", " ", txt)  # remove punctuation
         txt = re.sub(r"\s+", " ", txt).strip()
         return [t for t in txt.split(" ") if t]
 
-    first = ""
-    last_name = ""
-
-    # ADP often sends "Last, First Middle"
+    # Case 1: "Last, First Middle"
     if "," in s:
         parts = [p.strip() for p in s.split(",") if p.strip()]
         last_part = parts[0] if len(parts) >= 1 else ""
@@ -175,30 +173,23 @@ def normalize_person_name(x: str) -> str:
         last_tokens = _clean_tokens(last_part)
         first_tokens = _clean_tokens(first_part)
 
-        # Take only first token from given name, last token from surname
         first = first_tokens[0] if first_tokens else ""
         last_name = last_tokens[-1] if last_tokens else ""
 
-    else:
-        toks = _clean_tokens(s)
-        if not toks:
-            return ""
+        if first and last_name:
+            return f"{first} {last_name}".casefold()
+        return (first or last_name).casefold()
 
-        if len(toks) == 1:
-            first = toks[0]
-            last_name = toks[0]
-        elif len(toks) == 2:
-            # Be tolerant if someone writes "Young Roscoe" without comma
-            a, b = sorted(toks, key=lambda z: z.casefold())
-            return f"{a} {b}".casefold()
-        else:
-            # First + Last only; ignore middle tokens
-            first = toks[0]
-            last_name = toks[-1]
+    # Case 2: "First Last [Middle...]"
+    toks = _clean_tokens(s)
+    if not toks:
+        return ""
+    if len(toks) == 1:
+        return toks[0].casefold()
 
-    if first and last_name:
-        return f"{first} {last_name}".casefold()
-    return (first or last_name).casefold()
+    first = toks[0]
+    last_name = toks[-1]
+    return f"{first} {last_name}".casefold()
 
 
 def norm_value(x, field_name: str):
