@@ -419,6 +419,26 @@ def run_comparison(file_bytes: bytes) -> dict:
 
                 record_key = f"{bk}#{i+1}"
 
+                # Output should show the true Employee ID (not the internal base key used for matching)
+                employee_id_out = ""
+                try:
+                    if uz_idx is not None and emp_key_uz in uz_df.columns:
+                        v = uz_df.loc[uz_idx, emp_key_uz]
+                        employee_id_out = "" if v is None else str(v)
+                    elif ad_idx is not None and emp_key_ad in ad_df.columns:
+                        v = ad_df.loc[ad_idx, emp_key_ad]
+                        employee_id_out = "" if v is None else str(v)
+                except Exception:
+                    employee_id_out = ""
+
+                employee_id_out = employee_id_out.strip()
+                if employee_id_out == "":
+                    # fall back to the employee part of the base key
+                    try:
+                        employee_id_out = str(bk).split("|")[0]
+                    except Exception:
+                        employee_id_out = str(bk)
+
                 for _, r in sec_map.iterrows():
                     uz_field = r[uz_col_name]
                     adp_col_resolved = r["ADP_Resolved_Column"]
@@ -459,9 +479,8 @@ def run_comparison(file_bytes: bytes) -> dict:
 
                     rows.append(
                         {
-                            "Employee ID": bk,
+                            "Employee ID": employee_id_out,
                             "Section": section,
-                            "Record Key": record_key,
                             "Field": uz_field,
                             "UZIO_Value": uz_val,  # single UZIO value column
                             "ADP_Value": adp_val,
@@ -474,7 +493,6 @@ def run_comparison(file_bytes: bytes) -> dict:
             columns=[
                 "Employee ID",
                 "Section",
-                "Record Key",
                 "Field",
                 "UZIO_Value",
                 "ADP_Value",
