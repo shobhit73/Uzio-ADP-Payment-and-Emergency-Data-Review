@@ -70,10 +70,35 @@ def norm_blank(x):
     return x
 
 def digits_only(x):
+    """Extract digits while handling numeric types safely (avoid '.0' turning into extra zero)."""
     x = norm_blank(x)
     if x == "":
         return ""
-    return re.sub(r"\D", "", str(x))
+    # numeric types: preserve integer value
+    try:
+        if isinstance(x, (int, np.integer)):
+            return str(int(x))
+        if isinstance(x, (float, np.floating)):
+            if float(x).is_integer():
+                return str(int(x))
+            # fall back to string
+    except Exception:
+        pass
+
+    s = str(x).strip()
+    # common Excel artifact: '12345.0'
+    if re.fullmatch(r"\d+\.0+", s):
+        s = s.split(".")[0]
+    return re.sub(r"\D", "", s)
+
+def digits_only_padded(x, width: int):
+    d = digits_only(x)
+    if d == "":
+        return ""
+    if len(d) < width:
+        d = d.zfill(width)
+    return d
+
 
 def try_parse_date(x):
     x = norm_blank(x)
@@ -93,6 +118,9 @@ NUMERIC_KEYWORDS = {"salary", "rate", "hours", "amount", "percent", "percentage"
 DATE_KEYWORDS = {"date", "dob", "birth", "effective"}
 ZIP_KEYWORDS = {"zip", "zipcode", "postal"}
 PHONE_KEYWORDS = {"phone", "mobile"}
+
+ROUTING_KEYWORDS = {"routing"}
+ACCOUNTNUM_KEYWORDS = {"account number"}
 
 def norm_phone_digits(x):
     return digits_only(x)
@@ -124,6 +152,14 @@ def norm_value(x, field_name: str):
 
     if any(k in f for k in ZIP_KEYWORDS):
         return norm_zip_first5(x)
+
+    # Routing numbers are 9 digits; ADP/Excel often drops leading zeros or adds '.0'
+    if any(k in f for k in ROUTING_KEYWORDS):
+        return digits_only_padded(x, 9)
+
+    # Account numbers: digits only (do not pad)
+    if any(k in f for k in ACCOUNTNUM_KEYWORDS):
+        return digits_only(x)
 
     if any(k in f for k in DATE_KEYWORDS):
         return try_parse_date(x)
@@ -230,7 +266,7 @@ def build_payment_base_key(df: pd.DataFrame, emp_col: str):
 
     def _row_key(r):
         emp = norm_key_series(pd.Series([r.get(emp_col, "")])).iloc[0]
-        routing = digits_only(r.get(routing_col, "")) if routing_col else ""
+        routing = digits_only_padded(r.get(routing_col, ""), 9) if routing_col else ""
         acct = digits_only(r.get(acct_col, "")) if acct_col else ""
 
         dep_type = norm_value(r.get(dep_type_col, ""), "Deposit Type") if dep_type_col else ""
