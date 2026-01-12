@@ -8,13 +8,13 @@ import pandas as pd
 import streamlit as st
 
 # =========================================================
-# Payment & Emergency Contact Audit Tool (Streamlit)
+# UZIO vs ADP – Payment & Emergency Contact Comparison Tool
 # - Input workbook contains:
 #     1) Uzio Data
 #     2) ADP Payment Data
 #     3) ADP Emergency Contact Data
-#     4) Mapping Sheet
-# - Generates Excel report and provides download button
+#     4) Payment_Mapping
+#     5) Emergency_Mapping
 #
 # OUTPUT TABS (same structure as previous tool):
 #   - Summary
@@ -27,14 +27,14 @@ import streamlit as st
 # =========================================================
 
 APP_TITLE = "UZIO vs ADP – Payment & Emergency Contact Comparison Tool"
-OUTPUT_FILENAME = "UZIO_vs_ADP_Payment_EmergencyContact_Report_ADP_SourceOfTruth.xlsx"
 
 UZIO_SHEET = "Uzio Data"
 ADP_PAY_SHEET = "ADP Payment Data"
 ADP_EC_SHEET = "ADP Emergency Contact Data"
-MAP_SHEET = "Mapping Sheet"
+PAY_MAP_SHEET = "Payment_Mapping"
+EC_MAP_SHEET = "Emergency_Mapping"
 
-# ---------- UI: Hide sidebar + Streamlit chrome ----------
+# ---------- UI ----------
 st.set_page_config(page_title=APP_TITLE, layout="centered", initial_sidebar_state="collapsed")
 st.markdown(
     """
@@ -74,19 +74,16 @@ def digits_only(x):
     x = norm_blank(x)
     if x == "":
         return ""
-    # numeric types: preserve integer value
     try:
         if isinstance(x, (int, np.integer)):
             return str(int(x))
         if isinstance(x, (float, np.floating)):
             if float(x).is_integer():
                 return str(int(x))
-            # fall back to string
     except Exception:
         pass
 
     s = str(x).strip()
-    # common Excel artifact: '12345.0'
     if re.fullmatch(r"\d+\.0+", s):
         s = s.split(".")[0]
     return re.sub(r"\D", "", s)
@@ -98,7 +95,6 @@ def digits_only_padded(x, width: int):
     if len(d) < width:
         d = d.zfill(width)
     return d
-
 
 def try_parse_date(x):
     x = norm_blank(x)
@@ -142,21 +138,16 @@ def norm_zip_first5(x):
         s = s.zfill(5)
     return s[:5]
 
-
 def normalize_person_name(x: str) -> str:
     """
-    Normalize a person's name for comparison across formats.
-    Examples:
-      - "Young, Roscoe Robert" -> "roscoe young"
-      - "Roscoe Young"         -> "roscoe young"
-      - "Bell, Ronald"         -> "ronald bell"
-      - "Ronald Bell"          -> "ronald bell"
-    Middle names/initials/suffixes are ignored.
+    Normalize person names so these match:
+      - "Bell, Ronald" == "Ronald Bell"
+      - "Young, Roscoe Robert" == "Roscoe Young"  (middle ignored)
+    Strategy: compare FIRST + LAST only, ignore middle/suffix.
     """
     s = norm_blank(x)
     if s == "":
         return ""
-
     s = str(s).strip().replace("\u00A0", " ")
 
     def _clean_tokens(txt: str):
@@ -164,33 +155,29 @@ def normalize_person_name(x: str) -> str:
         txt = re.sub(r"\s+", " ", txt).strip()
         return [t for t in txt.split(" ") if t]
 
-    # Case 1: "Last, First Middle"
+    # "Last, First Middle"
     if "," in s:
         parts = [p.strip() for p in s.split(",") if p.strip()]
         last_part = parts[0] if len(parts) >= 1 else ""
         first_part = parts[1] if len(parts) >= 2 else ""
-
         last_tokens = _clean_tokens(last_part)
         first_tokens = _clean_tokens(first_part)
 
         first = first_tokens[0] if first_tokens else ""
         last_name = last_tokens[-1] if last_tokens else ""
-
         if first and last_name:
             return f"{first} {last_name}".casefold()
         return (first or last_name).casefold()
 
-    # Case 2: "First Last [Middle...]"
+    # "First Last [Middle...]"
     toks = _clean_tokens(s)
     if not toks:
         return ""
     if len(toks) == 1:
         return toks[0].casefold()
-
     first = toks[0]
     last_name = toks[-1]
     return f"{first} {last_name}".casefold()
-
 
 def norm_value(x, field_name: str):
     f = norm_colname(field_name).casefold()
@@ -204,18 +191,15 @@ def norm_value(x, field_name: str):
     if any(k in f for k in ZIP_KEYWORDS):
         return norm_zip_first5(x)
 
-    # Routing numbers are 9 digits; ADP/Excel often drops leading zeros or adds '.0'
     if any(k in f for k in ROUTING_KEYWORDS):
         return digits_only_padded(x, 9)
 
-    # Account numbers: digits only (do not pad)
     if any(k in f for k in ACCOUNTNUM_KEYWORDS):
         return digits_only(x)
 
     if any(k in f for k in DATE_KEYWORDS):
         return try_parse_date(x)
 
-    # Names: treat 'Last, First' as equal to 'First Last'
     if any(k in f for k in NAME_KEYWORDS):
         return normalize_person_name(x)
 
@@ -245,7 +229,6 @@ def norm_key_series(s: pd.Series) -> pd.Series:
     return s2.map(_fix)
 
 def find_col(df_cols, *candidate_names):
-    """Return actual column name from df_cols matching any candidate (case-insensitive, normalized)."""
     norm_map = {norm_colname(c).casefold(): c for c in df_cols}
     for cand in candidate_names:
         key = norm_colname(cand).casefold()
@@ -255,10 +238,10 @@ def find_col(df_cols, *candidate_names):
 
 def resolve_adp_col_label(label: str, adp_cols_all) -> str:
     """
-    Mapping sheet sometimes has values like:
+    Mapping sheet can have values like:
       'ASSOCIATE ID (or “Associate ID”)'
       'DEPOSIT PERCENT,' (trailing comma)
-    This resolves to the real column name present in either ADP sheet.
+    This resolves to real column names present in ADP sheets.
     """
     if label is None:
         return ""
@@ -270,15 +253,13 @@ def resolve_adp_col_label(label: str, adp_cols_all) -> str:
 
     adp_norm = {norm_colname(c).casefold(): c for c in adp_cols_all}
 
-    # Try direct normalized match
     direct = norm_colname(raw).casefold()
     if direct in adp_norm:
         return adp_norm[direct]
 
-    # Try split candidates by common separators
     parts = re.split(r"\(|\)|\bor\b|/|,|;", raw, flags=re.IGNORECASE)
     parts = [norm_colname(p) for p in parts if norm_colname(p)]
-    # also try the left side before " - " or " – "
+
     extra = []
     for p in parts:
         extra.extend([norm_colname(x) for x in re.split(r"\s[-–]\s", p) if norm_colname(x)])
@@ -289,27 +270,11 @@ def resolve_adp_col_label(label: str, adp_cols_all) -> str:
         if k in adp_norm:
             return adp_norm[k]
 
-    # As a last resort, try partial containment
     for k_norm, actual in adp_norm.items():
         if k_norm and (k_norm in direct or direct in k_norm):
             return actual
 
     return ""
-
-# ---------- Section detection ----------
-PAYMENT_FIELDS_HINTS = {"routing", "account", "deposit", "paycheck", "priority", "payment method", "distribution"}
-CONTACT_FIELDS_HINTS = {"contact", "relationship", "mobile", "phone", "primary"}
-
-def detect_section_from_adp_col(adp_col: str, pay_cols, ec_cols) -> str:
-    if adp_col in pay_cols:
-        return "Payment"
-    if adp_col in ec_cols:
-        return "Emergency Contact"
-    # fallback by name hint
-    c = norm_colname(adp_col).casefold()
-    if any(h in c for h in CONTACT_FIELDS_HINTS):
-        return "Emergency Contact"
-    return "Payment"
 
 # ---------- Record key builders ----------
 def build_payment_base_key(df: pd.DataFrame, emp_col: str):
@@ -328,10 +293,8 @@ def build_payment_base_key(df: pd.DataFrame, emp_col: str):
         amt = norm_value(r.get(dep_amt_col, ""), "Deposit Amount") if dep_amt_col else ""
         pct = norm_value(r.get(dep_pct_col, ""), "Deposit Percent") if dep_pct_col else ""
 
-        # Prefer bank identifiers when present
         if routing != "" or acct != "":
             return f"{emp}|BANK|{routing}|{acct}"
-        # fallback when bank details missing
         return f"{emp}|NOBANK|{dep_type}|{amt}|{pct}"
 
     return df.apply(_row_key, axis=1)
@@ -343,10 +306,9 @@ def build_contact_base_key(df: pd.DataFrame, emp_col: str):
 
     def _row_key(r):
         emp = norm_key_series(pd.Series([r.get(emp_col, "")])).iloc[0]
-        nm = norm_value(r.get(name_col, ""), "Contact Name") if name_col else ""
+        nm = normalize_person_name(r.get(name_col, "")) if name_col else ""
         ph = norm_phone_digits(r.get(phone_col, "")) if phone_col else ""
         rl = norm_value(r.get(rel_col, ""), "Relationship Description") if rel_col else ""
-        # name+phone is typically enough; add relationship to reduce collisions
         return f"{emp}|{nm}|{ph}|{rl}"
 
     return df.apply(_row_key, axis=1)
@@ -374,128 +336,106 @@ def filter_section_rows(uzio_df: pd.DataFrame, section: str):
         mask = mask | (uzio_df[c].map(norm_blank) != "")
     return uzio_df[mask].copy()
 
-# ---------- Core compare ----------
+def group_indices(df: pd.DataFrame):
+    g = {}
+    for idx, k in df["_base_key"].items():
+        k2 = "" if norm_blank(k) == "" else str(k)
+        g.setdefault(k2, []).append(idx)
+    return g
+
+def read_mapping_sheet(xls: pd.ExcelFile, sheet_name: str, adp_all_cols: list) -> pd.DataFrame:
+    m = pd.read_excel(xls, sheet_name=sheet_name, dtype=object)
+    m.columns = [norm_colname(c) for c in m.columns]
+
+    uz_col_name = None
+    adp_col_name = None
+    for c in m.columns:
+        if norm_colname(c).casefold() in {"uzio coloumn", "uzio column"}:
+            uz_col_name = c
+        if norm_colname(c).casefold() in {"adp coloumn", "adp column"}:
+            adp_col_name = c
+    if uz_col_name is None or adp_col_name is None:
+        raise ValueError(f"'{sheet_name}' must contain columns: 'UZIO Column' and 'ADP Column'.")
+
+    m[uz_col_name] = m[uz_col_name].map(norm_colname)
+    m[adp_col_name] = m[adp_col_name].map(norm_colname)
+
+    m = m.dropna(subset=[uz_col_name, adp_col_name]).copy()
+    m = m[(m[uz_col_name] != "") & (m[adp_col_name] != "")]
+    m = m.drop_duplicates(subset=[uz_col_name], keep="first").copy()
+
+    m["UZIO_Column"] = m[uz_col_name]
+    m["ADP_Label"] = m[adp_col_name]
+    m["ADP_Resolved_Column"] = m["ADP_Label"].map(lambda x: resolve_adp_col_label(x, adp_all_cols))
+
+    # exclude Employee ID row from comparisons (it is only key)
+    m["_uz_norm"] = m["UZIO_Column"].map(lambda x: norm_colname(x).casefold())
+    m = m[m["_uz_norm"] != "employee id"].copy()
+    m.drop(columns=["_uz_norm"], inplace=True)
+
+    return m
+
+# ---------- Core comparison ----------
 def run_comparison(file_bytes: bytes) -> dict:
     xls = pd.ExcelFile(io.BytesIO(file_bytes), engine="openpyxl")
 
     uzio = pd.read_excel(xls, sheet_name=UZIO_SHEET, dtype=object)
     adp_pay = pd.read_excel(xls, sheet_name=ADP_PAY_SHEET, dtype=object)
     adp_ec  = pd.read_excel(xls, sheet_name=ADP_EC_SHEET, dtype=object)
-    mapping = pd.read_excel(xls, sheet_name=MAP_SHEET, dtype=object)
 
-    # normalize column headers
     uzio.columns = [norm_colname(c) for c in uzio.columns]
     adp_pay.columns = [norm_colname(c) for c in adp_pay.columns]
     adp_ec.columns  = [norm_colname(c) for c in adp_ec.columns]
-    mapping.columns = [norm_colname(c) for c in mapping.columns]
 
-    # mapping columns: accept both spellings
-    uz_col_name = None
-    adp_col_name = None
-    for c in mapping.columns:
-        if norm_colname(c).casefold() in {"uzio coloumn", "uzio column"}:
-            uz_col_name = c
-        if norm_colname(c).casefold() in {"adp coloumn", "adp column"}:
-            adp_col_name = c
-    if uz_col_name is None or adp_col_name is None:
-        raise ValueError("Mapping sheet must contain columns: 'UZIO Column' and 'ADP Column' (or 'Uzio Coloumn'/'ADP Coloumn').")
-
-    mapping[uz_col_name] = mapping[uz_col_name].map(norm_colname)
-    mapping[adp_col_name] = mapping[adp_col_name].map(norm_colname)
-
-    mapping_valid = mapping.dropna(subset=[uz_col_name, adp_col_name]).copy()
-    mapping_valid = mapping_valid[(mapping_valid[uz_col_name] != "") & (mapping_valid[adp_col_name] != "")]
-    mapping_valid = mapping_valid.drop_duplicates(subset=[uz_col_name], keep="first").copy()
-
-    # Resolve ADP columns against both ADP tabs
-    adp_all_cols = list(adp_pay.columns) + list(adp_ec.columns)
-    mapping_valid["ADP_Resolved_Column"] = mapping_valid[adp_col_name].map(lambda x: resolve_adp_col_label(x, adp_all_cols))
-
-    # Identify key columns
+    # keys
     UZIO_KEY = find_col(uzio.columns, "Employee ID", "EmployeeID", "Employee Id")
     if UZIO_KEY is None:
-        raise ValueError("UZIO key column 'Employee ID' not found in Uzio Data tab.")
+        raise ValueError("UZIO key column 'Employee ID' not found in 'Uzio Data' tab.")
 
-    # ADP key columns per sheet
     ADP_PAY_KEY = find_col(adp_pay.columns, "ASSOCIATE ID", "Associate ID")
-    ADP_EC_KEY  = find_col(adp_ec.columns,  "Associate ID", "ASSOCIATE ID")
+    ADP_EC_KEY  = find_col(adp_ec.columns, "ASSOCIATE ID", "Associate ID")
     if ADP_PAY_KEY is None:
         raise ValueError("ADP Payment Data must contain 'ASSOCIATE ID' (or 'Associate ID').")
     if ADP_EC_KEY is None:
-        raise ValueError("ADP Emergency Contact Data must contain 'Associate ID' (or 'ASSOCIATE ID').")
+        raise ValueError("ADP Emergency Contact Data must contain 'ASSOCIATE ID' (or 'Associate ID').")
 
-    # normalize key values
+    # normalize keys
     uzio[UZIO_KEY] = norm_key_series(uzio[UZIO_KEY])
     adp_pay[ADP_PAY_KEY] = norm_key_series(adp_pay[ADP_PAY_KEY])
     adp_ec[ADP_EC_KEY]   = norm_key_series(adp_ec[ADP_EC_KEY])
 
-    # Split UZIO into two sections (based on populated columns)
+    # mapping sheets (separate)
+    adp_all_cols = list(adp_pay.columns) + list(adp_ec.columns)
+    pay_map = read_mapping_sheet(xls, PAY_MAP_SHEET, adp_all_cols)
+    ec_map  = read_mapping_sheet(xls, EC_MAP_SHEET, adp_all_cols)
+
+    # split UZIO data
     uzio_pay = filter_section_rows(uzio, "Payment")
     uzio_ec  = filter_section_rows(uzio, "Emergency Contact")
 
-    # Build base record keys
+    # base keys
     uzio_pay["_base_key"] = build_payment_base_key(uzio_pay, UZIO_KEY) if len(uzio_pay) else pd.Series(dtype=str)
     adp_pay["_base_key"]  = build_payment_base_key(adp_pay, ADP_PAY_KEY)
 
     uzio_ec["_base_key"]  = build_contact_base_key(uzio_ec, UZIO_KEY) if len(uzio_ec) else pd.Series(dtype=str)
     adp_ec["_base_key"]   = build_contact_base_key(adp_ec, ADP_EC_KEY)
 
-    # Group rows by base_key (to support duplicates)
-    def group_indices(df: pd.DataFrame):
-        g = {}
-        for idx, k in df["_base_key"].items():
-            k2 = "" if norm_blank(k) == "" else str(k)
-            g.setdefault(k2, []).append(idx)
-        return g
-
+    # groupings (support duplicates)
     g_uz_pay = group_indices(uzio_pay) if len(uzio_pay) else {}
     g_ad_pay = group_indices(adp_pay)
     g_uz_ec  = group_indices(uzio_ec) if len(uzio_ec) else {}
     g_ad_ec  = group_indices(adp_ec)
 
-    # Determine section for each mapping row
-    pay_cols_set = set(adp_pay.columns)
-    ec_cols_set  = set(adp_ec.columns)
+    def build_report_for_section(section: str, uz_df: pd.DataFrame, ad_df: pd.DataFrame,
+                                 g_uz: dict, g_ad: dict, emp_key_uz: str, emp_key_ad: str,
+                                 mapping_df: pd.DataFrame) -> bytes:
 
-    mapping_valid["Section"] = mapping_valid["ADP_Resolved_Column"].map(
-        lambda c: detect_section_from_adp_col(c, pay_cols_set, ec_cols_set) if c else "UNKNOWN"
-    )
+        # rows where ADP column could not be resolved
+        mapping_missing_adp_col = mapping_df[mapping_df["ADP_Resolved_Column"] == ""].copy()
 
-    # fields to compare (exclude Employee ID mapping itself)
-    mapped_fields = [f for f in mapping_valid[uz_col_name].tolist() if norm_colname(f).casefold() != "employee id"]
+        # rows to compare (must have resolved ADP column)
+        sec_map = mapping_df[mapping_df["ADP_Resolved_Column"] != ""].copy()
 
-    # Mapping missing ADP col
-    mapping_missing_adp_col = mapping_valid[(mapping_valid["ADP_Resolved_Column"] == "")].copy()
-
-    # ---------- Compare ----------
-    def build_report_for_section(
-        section: str,
-        uz_df: pd.DataFrame,
-        ad_df: pd.DataFrame,
-        g_uz: dict,
-        g_ad: dict,
-        emp_key_uz: str,
-        emp_key_ad: str,
-    ) -> bytes:
-        """
-        Build an output workbook (bytes) for a single section (Payment or Emergency Contact).
-        Supports multiple records per employee by pairing records within the same base key.
-        """
-        # mapping rows for this section
-        sec_map = mapping_valid[mapping_valid["Section"] == section].copy()
-        sec_map = sec_map[sec_map["ADP_Resolved_Column"] != ""]
-
-        # Mapping missing ADP columns (best-effort section guess using raw ADP label)
-        missing = mapping_valid[mapping_valid["ADP_Resolved_Column"] == ""].copy()
-        if len(missing):
-            missing["Section_Guess"] = missing[adp_col_name].map(
-                lambda c: detect_section_from_adp_col(c, pay_cols_set, ec_cols_set) if c else "UNKNOWN"
-            )
-            mapping_missing_adp_col = missing[(missing["Section_Guess"] == section) | (missing["Section_Guess"] == "UNKNOWN")].copy()
-        else:
-            mapping_missing_adp_col = missing
-
-        # which base keys to compare
         base_keys = sorted(set(g_uz.keys()).union(g_ad.keys()) - {""})
 
         rows = []
@@ -508,9 +448,7 @@ def run_comparison(file_bytes: bytes) -> dict:
                 uz_idx = uz_list[i] if i < len(uz_list) else None
                 ad_idx = ad_list[i] if i < len(ad_list) else None
 
-                record_key = f"{bk}#{i+1}"
-
-                # Output should show the true Employee ID (not the internal base key used for matching)
+                # employee id output
                 employee_id_out = ""
                 try:
                     if uz_idx is not None and emp_key_uz in uz_df.columns:
@@ -524,29 +462,18 @@ def run_comparison(file_bytes: bytes) -> dict:
 
                 employee_id_out = employee_id_out.strip()
                 if employee_id_out == "":
-                    # fall back to the employee part of the base key
                     try:
                         employee_id_out = str(bk).split("|")[0]
                     except Exception:
                         employee_id_out = str(bk)
 
                 for _, r in sec_map.iterrows():
-                    uz_field = r[uz_col_name]
+                    uz_field = r["UZIO_Column"]
                     adp_col_resolved = r["ADP_Resolved_Column"]
 
-                    # Values (single UZIO value column only)
-                    uz_val = (
-                        uz_df.loc[uz_idx, uz_field]
-                        if (uz_idx is not None and uz_field in uz_df.columns)
-                        else ""
-                    )
-                    adp_val = (
-                        ad_df.loc[ad_idx, adp_col_resolved]
-                        if (ad_idx is not None and adp_col_resolved in ad_df.columns)
-                        else ""
-                    )
+                    uz_val = uz_df.loc[uz_idx, uz_field] if (uz_idx is not None and uz_field in uz_df.columns) else ""
+                    adp_val = ad_df.loc[ad_idx, adp_col_resolved] if (ad_idx is not None and adp_col_resolved in ad_df.columns) else ""
 
-                    # status logic (ADP truth)
                     if ad_idx is None and uz_idx is not None:
                         status = "MISSING_IN_ADP"
                     elif ad_idx is not None and uz_idx is None:
@@ -573,7 +500,7 @@ def run_comparison(file_bytes: bytes) -> dict:
                             "Employee ID": employee_id_out,
                             "Section": section,
                             "Field": uz_field,
-                            "UZIO_Value": uz_val,  # single UZIO value column
+                            "UZIO_Value": uz_val,
                             "ADP_Value": adp_val,
                             "ADP_SourceOfTruth_Status": status,
                         }
@@ -581,19 +508,12 @@ def run_comparison(file_bytes: bytes) -> dict:
 
         comparison_detail = pd.DataFrame(
             rows,
-            columns=[
-                "Employee ID",
-                "Section",
-                "Field",
-                "UZIO_Value",
-                "ADP_Value",
-                "ADP_SourceOfTruth_Status",
-            ],
+            columns=["Employee ID", "Section", "Field", "UZIO_Value", "ADP_Value", "ADP_SourceOfTruth_Status"],
         )
 
         mismatches_only = comparison_detail[comparison_detail["ADP_SourceOfTruth_Status"] != "OK"].copy()
 
-        # Field Summary By Status
+        # Field summary
         if len(comparison_detail):
             comparison_detail["_FieldKey"] = comparison_detail["Section"] + " :: " + comparison_detail["Field"]
             statuses = [
@@ -664,7 +584,7 @@ def run_comparison(file_bytes: bytes) -> dict:
                     len(adp_emp - uzio_emp),
                     len(uz_df),
                     len(ad_df),
-                    len(sec_map),
+                    int(sec_map.shape[0]),
                     int(mapping_missing_adp_col.shape[0]),
                     int(comparison_detail.shape[0]),
                     int(mismatches_only.shape[0]),
@@ -683,7 +603,6 @@ def run_comparison(file_bytes: bytes) -> dict:
 
         return out.getvalue()
 
-    # Build independent reports
     payment_bytes = build_report_for_section(
         section="Payment",
         uz_df=uzio_pay,
@@ -692,6 +611,7 @@ def run_comparison(file_bytes: bytes) -> dict:
         g_ad=g_ad_pay,
         emp_key_uz=UZIO_KEY,
         emp_key_ad=ADP_PAY_KEY,
+        mapping_df=pay_map,
     )
 
     emergency_contact_bytes = build_report_for_section(
@@ -702,17 +622,14 @@ def run_comparison(file_bytes: bytes) -> dict:
         g_ad=g_ad_ec,
         emp_key_uz=UZIO_KEY,
         emp_key_ad=ADP_EC_KEY,
+        mapping_df=ec_map,
     )
 
-    return {
-        "payment": payment_bytes,
-        "emergency_contact": emergency_contact_bytes,
-    }
+    return {"payment": payment_bytes, "emergency_contact": emergency_contact_bytes}
 
-
-# ---------- Minimal UI ----------
+# ---------- UI ----------
 st.title(APP_TITLE)
-st.write("Upload the Excel workbook (.xlsx). The tool will generate the audit report and provide a download button.")
+st.write("Upload the Excel workbook (.xlsx). The tool will generate two independent reports (Payment + Emergency Contact).")
 
 uploaded_file = st.file_uploader("Upload Excel workbook", type=["xlsx"])
 run_btn = st.button("Run Audit", type="primary", disabled=(uploaded_file is None))
