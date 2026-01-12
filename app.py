@@ -284,7 +284,7 @@ def filter_section_rows(uzio_df: pd.DataFrame, section: str):
     return uzio_df[mask].copy()
 
 # ---------- Core compare ----------
-def run_comparison(file_bytes: bytes) -> bytes:
+def run_comparison(file_bytes: bytes) -> dict:
     xls = pd.ExcelFile(io.BytesIO(file_bytes), engine="openpyxl")
 
     uzio = pd.read_excel(xls, sheet_name=UZIO_SHEET, dtype=object)
@@ -377,17 +377,37 @@ def run_comparison(file_bytes: bytes) -> bytes:
     mapping_missing_adp_col = mapping_valid[(mapping_valid["ADP_Resolved_Column"] == "")].copy()
 
     # ---------- Compare ----------
-    rows = []
-
-    def compare_section(section: str, uz_df: pd.DataFrame, ad_df: pd.DataFrame, g_uz: dict, g_ad: dict, emp_key_uz: str, emp_key_ad: str):
-        # Pick mapping rows for this section (ignore unknown)
+    def build_report_for_section(
+        section: str,
+        uz_df: pd.DataFrame,
+        ad_df: pd.DataFrame,
+        g_uz: dict,
+        g_ad: dict,
+        emp_key_uz: str,
+        emp_key_ad: str,
+    ) -> bytes:
+        """
+        Build an output workbook (bytes) for a single section (Payment or Emergency Contact).
+        Supports multiple records per employee by pairing records within the same base key.
+        """
+        # mapping rows for this section
         sec_map = mapping_valid[mapping_valid["Section"] == section].copy()
-
-        # For robustness, if a field's ADP resolved col is in the other sheet, skip it here
         sec_map = sec_map[sec_map["ADP_Resolved_Column"] != ""]
 
+        # Mapping missing ADP columns (best-effort section guess using raw ADP label)
+        missing = mapping_valid[mapping_valid["ADP_Resolved_Column"] == ""].copy()
+        if len(missing):
+            missing["Section_Guess"] = missing[adp_col_name].map(
+                lambda c: detect_section_from_adp_col(c, pay_cols_set, ec_cols_set) if c else "UNKNOWN"
+            )
+            mapping_missing_adp_col = missing[(missing["Section_Guess"] == section) | (missing["Section_Guess"] == "UNKNOWN")].copy()
+        else:
+            mapping_missing_adp_col = missing
+
+        # which base keys to compare
         base_keys = sorted(set(g_uz.keys()).union(g_ad.keys()) - {""})
 
+        rows = []
         for bk in base_keys:
             uz_list = g_uz.get(bk, [])
             ad_list = g_ad.get(bk, [])
@@ -397,27 +417,23 @@ def run_comparison(file_bytes: bytes) -> bytes:
                 uz_idx = uz_list[i] if i < len(uz_list) else None
                 ad_idx = ad_list[i] if i < len(ad_list) else None
 
-                # Employee ID for reporting
-                emp_id = ""
-                if uz_idx is not None:
-                    emp_id = str(uz_df.at[uz_idx, emp_key_uz])
-                elif ad_idx is not None:
-                    emp_id = str(ad_df.at[ad_idx, emp_key_ad])
-                else:
-                    # parse from base key
-                    emp_id = str(bk).split("|", 1)[0] if "|" in str(bk) else str(bk)
+                record_key = f"{bk}#{i+1}"
 
-                record_key = f"{bk} [#{i+1}]"
+                for _, r in sec_map.iterrows():
+                    uz_field = r[uz_col_name]
+                    adp_col_resolved = r["ADP_Resolved_Column"]
 
-                for _, mr in sec_map.iterrows():
-                    uz_field = mr[uz_col_name]
-                    adp_col_resolved = mr["ADP_Resolved_Column"]
-
-                    # if this UZIO field doesn't exist, treat as blank
-                    uz_val = uz_df.at[uz_idx, uz_field] if (uz_idx is not None and uz_field in uz_df.columns) else ""
-
-                    # choose ADP value (same section sheet)
-                    adp_val = ad_df.at[ad_idx, adp_col_resolved] if (ad_idx is not None and adp_col_resolved in ad_df.columns) else ""
+                    # Values (single UZIO value column only)
+                    uz_val = (
+                        uz_df.loc[uz_idx, uz_field]
+                        if (uz_idx is not None and uz_field in uz_df.columns)
+                        else ""
+                    )
+                    adp_val = (
+                        ad_df.loc[ad_idx, adp_col_resolved]
+                        if (ad_idx is not None and adp_col_resolved in ad_df.columns)
+                        else ""
+                    )
 
                     # status logic (ADP truth)
                     if ad_idx is None and uz_idx is not None:
@@ -426,6 +442,8 @@ def run_comparison(file_bytes: bytes) -> bytes:
                         status = "MISSING_IN_UZIO"
                     elif adp_col_resolved not in ad_df.columns:
                         status = "ADP_COLUMN_MISSING"
+                    elif uz_field not in uz_df.columns:
+                        status = "UZIO_COLUMN_MISSING"
                     else:
                         uz_n = norm_value(uz_val, uz_field)
                         ad_n = norm_value(adp_val, uz_field)
@@ -439,116 +457,149 @@ def run_comparison(file_bytes: bytes) -> bytes:
                         else:
                             status = "MISMATCH"
 
-                    rows.append({
-                        "Employee ID": emp_id,
-                        "Section": section,
-                        "Record Key": record_key,
-                        "Field": uz_field,
-                        "UZIO_Value": uz_val,      # single UZIO value column
-                        "ADP_Value": adp_val,
-                        "ADP_SourceOfTruth_Status": status
-                    })
+                    rows.append(
+                        {
+                            "Employee ID": bk,
+                            "Section": section,
+                            "Record Key": record_key,
+                            "Field": uz_field,
+                            "UZIO_Value": uz_val,  # single UZIO value column
+                            "ADP_Value": adp_val,
+                            "ADP_SourceOfTruth_Status": status,
+                        }
+                    )
 
-    # Run comparisons
-    compare_section("Payment", uzio_pay, adp_pay, g_uz_pay, g_ad_pay, UZIO_KEY, ADP_PAY_KEY)
-    compare_section("Emergency Contact", uzio_ec, adp_ec, g_uz_ec, g_ad_ec, UZIO_KEY, ADP_EC_KEY)
+        comparison_detail = pd.DataFrame(
+            rows,
+            columns=[
+                "Employee ID",
+                "Section",
+                "Record Key",
+                "Field",
+                "UZIO_Value",
+                "ADP_Value",
+                "ADP_SourceOfTruth_Status",
+            ],
+        )
 
-    comparison_detail = pd.DataFrame(rows)[[
-        "Employee ID", "Section", "Record Key",
-        "Field", "UZIO_Value", "ADP_Value", "ADP_SourceOfTruth_Status"
-    ]]
+        mismatches_only = comparison_detail[comparison_detail["ADP_SourceOfTruth_Status"] != "OK"].copy()
 
-    mismatches_only = comparison_detail[comparison_detail["ADP_SourceOfTruth_Status"] != "OK"].copy()
+        # Field Summary By Status
+        if len(comparison_detail):
+            comparison_detail["_FieldKey"] = comparison_detail["Section"] + " :: " + comparison_detail["Field"]
+            statuses = [
+                "OK",
+                "MISMATCH",
+                "UZIO_MISSING_VALUE",
+                "ADP_MISSING_VALUE",
+                "MISSING_IN_UZIO",
+                "MISSING_IN_ADP",
+                "ADP_COLUMN_MISSING",
+                "UZIO_COLUMN_MISSING",
+            ]
+            field_summary_by_status = (
+                comparison_detail.pivot_table(
+                    index="_FieldKey",
+                    columns="ADP_SourceOfTruth_Status",
+                    values="Employee ID",
+                    aggfunc="count",
+                    fill_value=0,
+                )
+                .reindex(columns=statuses, fill_value=0)
+                .reset_index()
+                .rename(columns={"_FieldKey": "Field"})
+            )
+            field_summary_by_status["Total"] = field_summary_by_status[statuses].sum(axis=1)
+        else:
+            field_summary_by_status = pd.DataFrame(
+                columns=[
+                    "Field",
+                    "OK",
+                    "MISMATCH",
+                    "UZIO_MISSING_VALUE",
+                    "ADP_MISSING_VALUE",
+                    "MISSING_IN_UZIO",
+                    "MISSING_IN_ADP",
+                    "ADP_COLUMN_MISSING",
+                    "UZIO_COLUMN_MISSING",
+                    "Total",
+                ]
+            )
 
-    # Field Summary By Status (Field is section-qualified to avoid collisions)
-    comparison_detail["_FieldKey"] = comparison_detail["Section"] + " :: " + comparison_detail["Field"]
+        # Summary
+        uzio_emp = set(uz_df[emp_key_uz].dropna().map(str)) if (len(uz_df) and emp_key_uz in uz_df.columns) else set()
+        adp_emp = set(ad_df[emp_key_ad].dropna().map(str)) if (len(ad_df) and emp_key_ad in ad_df.columns) else set()
 
-    cols_needed = [
-        "OK",
-        "MISMATCH",
-        "UZIO_MISSING_VALUE",
-        "ADP_MISSING_VALUE",
-        "MISSING_IN_UZIO",
-        "MISSING_IN_ADP",
-        "ADP_COLUMN_MISSING",
-    ]
+        summary = pd.DataFrame(
+            {
+                "Metric": [
+                    "Section",
+                    "Total UZIO Employees",
+                    "Total ADP Employees",
+                    "Employees in both",
+                    "Employees only in UZIO",
+                    "Employees only in ADP",
+                    "Total UZIO Records",
+                    "Total ADP Records",
+                    "Fields Compared",
+                    "Mapping Missing ADP Col (this section)",
+                    "Total Comparisons (field-level rows)",
+                    "Total Mismatches/Issues (non-OK)",
+                ],
+                "Value": [
+                    section,
+                    len(uzio_emp),
+                    len(adp_emp),
+                    len(uzio_emp & adp_emp),
+                    len(uzio_emp - adp_emp),
+                    len(adp_emp - uzio_emp),
+                    len(uz_df),
+                    len(ad_df),
+                    len(sec_map),
+                    int(mapping_missing_adp_col.shape[0]),
+                    int(comparison_detail.shape[0]),
+                    int(mismatches_only.shape[0]),
+                ],
+            }
+        )
 
-    pivot = comparison_detail.pivot_table(
-        index="_FieldKey",
-        columns="ADP_SourceOfTruth_Status",
-        values="Employee ID",
-        aggfunc="count",
-        fill_value=0
+        # write excel
+        out = io.BytesIO()
+        with pd.ExcelWriter(out, engine="openpyxl") as writer:
+            summary.to_excel(writer, sheet_name="Summary", index=False)
+            field_summary_by_status.to_excel(writer, sheet_name="Field_Summary_By_Status", index=False)
+            mapping_missing_adp_col.to_excel(writer, sheet_name="Mapping_ADP_Col_Missing", index=False)
+            comparison_detail.to_excel(writer, sheet_name="Comparison_Detail_AllFields", index=False)
+            mismatches_only.to_excel(writer, sheet_name="Mismatches_Only", index=False)
+
+        return out.getvalue()
+
+    # Build independent reports
+    payment_bytes = build_report_for_section(
+        section="Payment",
+        uz_df=uzio_pay,
+        ad_df=adp_pay,
+        g_uz=g_uz_pay,
+        g_ad=g_ad_pay,
+        emp_key_uz=UZIO_KEY,
+        emp_key_ad=ADP_PAY_KEY,
     )
 
-    for c in cols_needed:
-        if c not in pivot.columns:
-            pivot[c] = 0
+    emergency_contact_bytes = build_report_for_section(
+        section="Emergency Contact",
+        uz_df=uzio_ec,
+        ad_df=adp_ec,
+        g_uz=g_uz_ec,
+        g_ad=g_ad_ec,
+        emp_key_uz=UZIO_KEY,
+        emp_key_ad=ADP_EC_KEY,
+    )
 
-    pivot["Total"] = pivot.sum(axis=1)
-    pivot["OK"] = pivot["OK"].astype(int)
-    pivot["NOT_OK"] = (pivot["Total"] - pivot["OK"]).astype(int)
+    return {
+        "payment": payment_bytes,
+        "emergency_contact": emergency_contact_bytes,
+    }
 
-    field_summary_by_status = pivot.reset_index().rename(columns={"_FieldKey": "Field"})[[
-        "Field",
-        "Total",
-        "OK",
-        "NOT_OK",
-        "MISMATCH",
-        "UZIO_MISSING_VALUE",
-        "ADP_MISSING_VALUE",
-        "MISSING_IN_UZIO",
-        "MISSING_IN_ADP",
-        "ADP_COLUMN_MISSING",
-    ]]
-
-    # Summary metrics (section-aware)
-    uzio_emp = set(uzio[UZIO_KEY].dropna().astype(str).str.strip()) - {""}
-    adp_emp  = (set(adp_pay[ADP_PAY_KEY].dropna().astype(str).str.strip()) - {""}) | (set(adp_ec[ADP_EC_KEY].dropna().astype(str).str.strip()) - {""})
-
-    summary = pd.DataFrame({
-        "Metric": [
-            "Employees in UZIO sheet",
-            "Employees in ADP (Payment + Emergency Contact) sheets",
-            "Employees present in both",
-            "Employees missing in ADP (UZIO only)",
-            "Employees missing in UZIO (ADP only)",
-            "UZIO Payment records",
-            "ADP Payment records",
-            "UZIO Emergency Contact records",
-            "ADP Emergency Contact records",
-            "Mapped fields total (from mapping sheet)",
-            "Mapped fields with ADP column missing/unresolved",
-            "Total comparison rows (record-pairs x mapped fields)",
-            "Total NOT OK rows"
-        ],
-        "Value": [
-            len(uzio_emp),
-            len(adp_emp),
-            len(uzio_emp.intersection(adp_emp)),
-            len(uzio_emp - adp_emp),
-            len(adp_emp - uzio_emp),
-            len(uzio_pay),
-            len(adp_pay),
-            len(uzio_ec),
-            len(adp_ec),
-            len(mapped_fields),
-            mapping_missing_adp_col.shape[0],
-            comparison_detail.shape[0],
-            mismatches_only.shape[0]
-        ]
-    })
-
-    # write excel
-    out = io.BytesIO()
-    with pd.ExcelWriter(out, engine="openpyxl") as writer:
-        summary.to_excel(writer, sheet_name="Summary", index=False)
-        field_summary_by_status.to_excel(writer, sheet_name="Field_Summary_By_Status", index=False)
-        mapping_missing_adp_col.to_excel(writer, sheet_name="Mapping_ADP_Col_Missing", index=False)
-        comparison_detail.to_excel(writer, sheet_name="Comparison_Detail_AllFields", index=False)
-        mismatches_only.to_excel(writer, sheet_name="Mismatches_Only", index=False)
-
-    return out.getvalue()
 
 # ---------- Minimal UI ----------
 st.title(APP_TITLE)
@@ -560,15 +611,30 @@ run_btn = st.button("Run Audit", type="primary", disabled=(uploaded_file is None
 if run_btn:
     try:
         with st.spinner("Running audit..."):
-            report_bytes = run_comparison(uploaded_file.getvalue())
+            reports = run_comparison(uploaded_file.getvalue())
 
-        st.success("Report generated.")
-        st.download_button(
-            label="Download Report (.xlsx)",
-            data=report_bytes,
-            file_name=OUTPUT_FILENAME,
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            type="primary",
-        )
+        st.success("Reports generated (Payment + Emergency Contact).")
+
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        payment_name = f"UZIO_vs_ADP_Payment_Report_ADP_SourceOfTruth_{ts}.xlsx"
+        ec_name = f"UZIO_vs_ADP_EmergencyContact_Report_ADP_SourceOfTruth_{ts}.xlsx"
+
+        col1, col2 = st.columns(2)
+        with col1:
+            st.download_button(
+                label="Download Payment Report (.xlsx)",
+                data=reports["payment"],
+                file_name=payment_name,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                type="primary",
+            )
+        with col2:
+            st.download_button(
+                label="Download Emergency Contact Report (.xlsx)",
+                data=reports["emergency_contact"],
+                file_name=ec_name,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                type="secondary",
+            )
     except Exception as e:
         st.error(f"Failed: {e}")
