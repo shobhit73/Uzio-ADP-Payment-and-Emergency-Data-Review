@@ -7,6 +7,25 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
+# =========================================================
+# UZIO vs ADP – Payment & Emergency Contact Comparison Tool
+# INPUT workbook tabs:
+#   - Uzio Data
+#   - ADP Payment Data
+#   - ADP Emergency Contact Data
+#   - Payment_Mapping
+#   - Emergency_Mapping
+#
+# OUTPUT (per report) tabs:
+#   - Summary
+#   - Field_Summary_By_Status   (with specific columns removed)
+#   - Comparison_Detail_AllFields (NO FieldKey helper column)
+#
+# REMOVED output sheets (per request):
+#   - Mismatches_Only
+#   - Mapping_ADP_Col_Missing
+# =========================================================
+
 APP_TITLE = "UZIO vs ADP – Payment & Emergency Contact Comparison Tool"
 
 UZIO_SHEET = "Uzio Data"
@@ -15,6 +34,7 @@ ADP_EC_SHEET = "ADP Emergency Contact Data"
 PAY_MAP_SHEET = "Payment_Mapping"
 EC_MAP_SHEET = "Emergency_Mapping"
 
+# ---------- UI ----------
 st.set_page_config(page_title=APP_TITLE, layout="centered", initial_sidebar_state="collapsed")
 st.markdown(
     """
@@ -28,6 +48,7 @@ st.markdown(
     unsafe_allow_html=True
 )
 
+# ---------- Helpers ----------
 def norm_colname(c: str) -> str:
     if c is None:
         return ""
@@ -49,6 +70,7 @@ def norm_blank(x):
     return x
 
 def digits_only(x):
+    """Extract digits while handling numeric types safely (avoid '.0' artifacts)."""
     x = norm_blank(x)
     if x == "":
         return ""
@@ -98,7 +120,25 @@ ROUTING_KEYWORDS = {"routing"}
 ACCOUNTNUM_KEYWORDS = {"account number"}
 
 def norm_phone_digits(x):
-    return digits_only(x)
+    """
+    Normalize phone numbers to digits-only and handle ADP vs UZIO formatting differences.
+    Example:
+      (410) 292-5939 -> 4102925939
+      4102925939     -> 4102925939
+    """
+    d = digits_only(x)
+    if d == "":
+        return ""
+
+    # Drop US country code if present
+    if len(d) == 11 and d.startswith("1"):
+        d = d[1:]
+
+    # If longer than 10 (extensions/country leakage), keep last 10
+    if len(d) > 10:
+        d = d[-10:]
+
+    return d
 
 def norm_zip_first5(x):
     x = norm_blank(x)
@@ -117,16 +157,23 @@ def norm_zip_first5(x):
     return s[:5]
 
 def normalize_person_name(x: str) -> str:
+    """
+    Normalize person names so these match:
+      - "Bell, Ronald" == "Ronald Bell"
+      - "Young, Roscoe Robert" == "Roscoe Young" (middle ignored)
+    Compare FIRST + LAST only.
+    """
     s = norm_blank(x)
     if s == "":
         return ""
     s = str(s).strip().replace("\u00A0", " ")
 
     def _clean_tokens(txt: str):
-        txt = re.sub(r"[^A-Za-z0-9\s]", " ", txt)
+        txt = re.sub(r"[^A-Za-z0-9\s]", " ", txt)  # remove punctuation
         txt = re.sub(r"\s+", " ", txt).strip()
         return [t for t in txt.split(" ") if t]
 
+    # "Last, First Middle"
     if "," in s:
         parts = [p.strip() for p in s.split(",") if p.strip()]
         last_part = parts[0] if len(parts) >= 1 else ""
@@ -136,10 +183,12 @@ def normalize_person_name(x: str) -> str:
 
         first = first_tokens[0] if first_tokens else ""
         last_name = last_tokens[-1] if last_tokens else ""
+
         if first and last_name:
             return f"{first} {last_name}".casefold()
         return (first or last_name).casefold()
 
+    # "First Last [Middle...]"
     toks = _clean_tokens(s)
     if not toks:
         return ""
@@ -207,6 +256,12 @@ def find_col(df_cols, *candidate_names):
     return None
 
 def resolve_adp_col_label(label: str, adp_cols_all) -> str:
+    """
+    Mapping sheet can have values like:
+      'ASSOCIATE ID (or “Associate ID”)'
+      'DEPOSIT PERCENT,' (trailing comma)
+    Resolve to actual ADP column names present in sheets.
+    """
     if label is None:
         return ""
     raw = str(label).strip()
@@ -240,6 +295,7 @@ def resolve_adp_col_label(label: str, adp_cols_all) -> str:
 
     return ""
 
+# ---------- Record key builders ----------
 def build_payment_base_key(df: pd.DataFrame, emp_col: str):
     routing_col = find_col(df.columns, "ROUTING NUMBER", "Routing Number")
     acct_col = find_col(df.columns, "ACCOUNT NUMBER", "Account Number")
@@ -277,6 +333,7 @@ def build_contact_base_key(df: pd.DataFrame, emp_col: str):
     return df.apply(_row_key, axis=1)
 
 def filter_section_rows(uzio_df: pd.DataFrame, section: str):
+    """UZIO sheet may contain both sections; infer by which fields are populated."""
     if section == "Payment":
         routing = find_col(uzio_df.columns, "Routing Number", "ROUTING NUMBER")
         acct = find_col(uzio_df.columns, "Account Number", "ACCOUNT NUMBER")
@@ -330,15 +387,15 @@ def read_mapping_sheet(xls: pd.ExcelFile, sheet_name: str, adp_all_cols: list) -
     m["ADP_Label"] = m[adp_col_name]
     m["ADP_Resolved_Column"] = m["ADP_Label"].map(lambda x: resolve_adp_col_label(x, adp_all_cols))
 
+    # exclude Employee ID row from comparisons (it is only key)
     m["_uz_norm"] = m["UZIO_Column"].map(lambda x: norm_colname(x).casefold())
     m = m[m["_uz_norm"] != "employee id"].copy()
     m.drop(columns=["_uz_norm"], inplace=True)
 
     return m
 
-# --------- ONLY CHANGE: drop columns G,H,I from Field_Summary_By_Status ----------
-def drop_GHI_columns(field_summary_df: pd.DataFrame) -> pd.DataFrame:
-    # Remove specific columns by name (if present)
+# ---------- Field Summary cleanup (remove specific columns by name) ----------
+def drop_unwanted_field_summary_columns(field_summary_df: pd.DataFrame) -> pd.DataFrame:
     if field_summary_df is None or field_summary_df.empty:
         return field_summary_df
 
@@ -346,10 +403,9 @@ def drop_GHI_columns(field_summary_df: pd.DataFrame) -> pd.DataFrame:
     existing = [c for c in cols_to_drop if c in field_summary_df.columns]
     if existing:
         field_summary_df = field_summary_df.drop(columns=existing)
-
     return field_summary_df
 
-
+# ---------- Core comparison ----------
 def run_comparison(file_bytes: bytes) -> dict:
     xls = pd.ExcelFile(io.BytesIO(file_bytes), engine="openpyxl")
 
@@ -361,6 +417,7 @@ def run_comparison(file_bytes: bytes) -> dict:
     adp_pay.columns = [norm_colname(c) for c in adp_pay.columns]
     adp_ec.columns  = [norm_colname(c) for c in adp_ec.columns]
 
+    # keys
     UZIO_KEY = find_col(uzio.columns, "Employee ID", "EmployeeID", "Employee Id")
     if UZIO_KEY is None:
         raise ValueError("UZIO key column 'Employee ID' not found in 'Uzio Data' tab.")
@@ -372,23 +429,28 @@ def run_comparison(file_bytes: bytes) -> dict:
     if ADP_EC_KEY is None:
         raise ValueError("ADP Emergency Contact Data must contain 'ASSOCIATE ID' (or 'Associate ID').")
 
+    # normalize keys
     uzio[UZIO_KEY] = norm_key_series(uzio[UZIO_KEY])
     adp_pay[ADP_PAY_KEY] = norm_key_series(adp_pay[ADP_PAY_KEY])
     adp_ec[ADP_EC_KEY]   = norm_key_series(adp_ec[ADP_EC_KEY])
 
+    # mapping sheets (separate)
     adp_all_cols = list(adp_pay.columns) + list(adp_ec.columns)
     pay_map = read_mapping_sheet(xls, PAY_MAP_SHEET, adp_all_cols)
     ec_map  = read_mapping_sheet(xls, EC_MAP_SHEET, adp_all_cols)
 
+    # split UZIO data
     uzio_pay = filter_section_rows(uzio, "Payment")
     uzio_ec  = filter_section_rows(uzio, "Emergency Contact")
 
+    # base keys
     uzio_pay["_base_key"] = build_payment_base_key(uzio_pay, UZIO_KEY) if len(uzio_pay) else pd.Series(dtype=str)
     adp_pay["_base_key"]  = build_payment_base_key(adp_pay, ADP_PAY_KEY)
 
     uzio_ec["_base_key"]  = build_contact_base_key(uzio_ec, UZIO_KEY) if len(uzio_ec) else pd.Series(dtype=str)
     adp_ec["_base_key"]   = build_contact_base_key(adp_ec, ADP_EC_KEY)
 
+    # groupings (support duplicates)
     g_uz_pay = group_indices(uzio_pay) if len(uzio_pay) else {}
     g_ad_pay = group_indices(adp_pay)
     g_uz_ec  = group_indices(uzio_ec) if len(uzio_ec) else {}
@@ -398,6 +460,7 @@ def run_comparison(file_bytes: bytes) -> dict:
                                  g_uz: dict, g_ad: dict, emp_key_uz: str, emp_key_ad: str,
                                  mapping_df: pd.DataFrame) -> bytes:
 
+        # rows to compare (must have resolved ADP column)
         sec_map = mapping_df[mapping_df["ADP_Resolved_Column"] != ""].copy()
 
         base_keys = sorted(set(g_uz.keys()).union(g_ad.keys()) - {""})
@@ -412,6 +475,7 @@ def run_comparison(file_bytes: bytes) -> dict:
                 uz_idx = uz_list[i] if i < len(uz_list) else None
                 ad_idx = ad_list[i] if i < len(ad_list) else None
 
+                # employee id output
                 employee_id_out = ""
                 try:
                     if uz_idx is not None and emp_key_uz in uz_df.columns:
@@ -476,7 +540,9 @@ def run_comparison(file_bytes: bytes) -> dict:
 
         # Field summary
         if len(comparison_detail):
+            # helper col used ONLY for pivot, then discarded (not included in output)
             comparison_detail["_FieldKey"] = comparison_detail["Section"] + " :: " + comparison_detail["Field"]
+
             statuses = [
                 "OK",
                 "MISMATCH",
@@ -516,8 +582,12 @@ def run_comparison(file_bytes: bytes) -> dict:
                 ]
             )
 
-        # --------- ONLY CHANGE: drop columns G,H,I ----------
-        field_summary_by_status = drop_GHI_columns(field_summary_by_status)
+        # Remove columns requested from Field_Summary_By_Status
+        field_summary_by_status = drop_unwanted_field_summary_columns(field_summary_by_status)
+
+        # Remove FieldKey helper column from Comparison_Detail_AllFields output
+        if "_FieldKey" in comparison_detail.columns:
+            comparison_detail = comparison_detail.drop(columns=["_FieldKey"])
 
         # Summary
         uzio_emp = set(uz_df[emp_key_uz].dropna().map(str)) if (len(uz_df) and emp_key_uz in uz_df.columns) else set()
@@ -557,7 +627,9 @@ def run_comparison(file_bytes: bytes) -> dict:
             summary.to_excel(writer, sheet_name="Summary", index=False)
             field_summary_by_status.to_excel(writer, sheet_name="Field_Summary_By_Status", index=False)
             comparison_detail.to_excel(writer, sheet_name="Comparison_Detail_AllFields", index=False)
-            # --------- ONLY CHANGE: Do NOT write Mapping_ADP_Col_Missing and Mismatches_Only ----------
+            # Removed (per request):
+            # - Mapping_ADP_Col_Missing
+            # - Mismatches_Only
 
         return out.getvalue()
 
@@ -585,6 +657,7 @@ def run_comparison(file_bytes: bytes) -> dict:
 
     return {"payment": payment_bytes, "emergency_contact": emergency_contact_bytes}
 
+# ---------- UI ----------
 st.title(APP_TITLE)
 st.write("Upload the Excel workbook (.xlsx). The tool will generate two independent reports (Payment + Emergency Contact).")
 
