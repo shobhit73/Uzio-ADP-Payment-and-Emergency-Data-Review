@@ -9,6 +9,7 @@ import streamlit as st
 
 # =========================================================
 # UZIO vs ADP – Payment & Emergency Contact Comparison Tool
+#
 # INPUT workbook tabs:
 #   - Uzio Data
 #   - ADP Payment Data
@@ -17,20 +18,25 @@ import streamlit as st
 #   - Emergency_Mapping
 #
 # OUTPUT (two independent reports):
-#   Payment report tabs:
-#     - Summary
-#     - Field_Summary_By_Status (columns removed: MISSING_IN_ADP, ADP_COLUMN_MISSING, UZIO_COLUMN_MISSING)
-#     - Comparison_Detail_AllFields (NO FieldKey column)
-#   Emergency Contact report tabs:
-#     - Summary
-#     - Field_Summary_By_Status (same cleanup)
-#     - Comparison_Detail_AllFields (NO FieldKey column)
+#   - Summary
+#   - Field_Summary_By_Status   (columns removed: MISSING_IN_ADP, ADP_COLUMN_MISSING, UZIO_COLUMN_MISSING)
+#   - Comparison_Detail_AllFields (NO FieldKey column)
 #
-# IMPORTANT BUSINESS RULE (Payment):
-#   Uses ADP DEPOSIT TYPE to derive UZIO-like Paycheck Distribution/Percentage/Amount/Priority
-#   - FULL => % based
-#     * If FULL + Partial% : FULL% = 100 - sum(Partial%); FULL gets least priority (last)
-#     * If FULL + Partial  : FULL gets least priority (last), Partial amount rows come before it
+# PAYMENT BUSINESS RULE (ADP -> UZIO-like normalization):
+#   - FULL => percentage based
+#   - Partial => amount based
+#   - Partial% => percentage based
+#   - Full + Partial => Full is last priority, Partial accounts before it
+#   - Full + Partial% => Full% = 100 - sum(Partial%); Full is last priority
+#
+# ADDITIONAL FIXES:
+#   1) UZIO "Flat Dollar" distribution is treated as "amount" (so no mismatch with ADP "amount")
+#   2) UZIO FULL-row inference:
+#        if an employee has multiple payment rows and exactly one row has BOTH
+#        Paycheck Amount blank AND Paycheck Percentage blank,
+#        treat that row as FULL/remainder:
+#          - set Paycheck Distribution to "Percentage"
+#          - set Paycheck Percentage to 100 - sum(other partial% if any), else 100
 # =========================================================
 
 APP_TITLE = "UZIO vs ADP – Payment & Emergency Contact Comparison Tool"
@@ -67,6 +73,7 @@ def norm_colname(c: str) -> str:
     c = c.strip('"').strip("'")
     return c
 
+
 def norm_blank(x):
     if x is None:
         return ""
@@ -75,6 +82,7 @@ def norm_blank(x):
     if isinstance(x, str) and x.strip().lower() in {"", "nan", "none", "null"}:
         return ""
     return x
+
 
 def digits_only(x):
     """Extract digits while handling numeric types safely (avoid '.0' artifacts)."""
@@ -95,6 +103,7 @@ def digits_only(x):
         s = s.split(".")[0]
     return re.sub(r"\D", "", s)
 
+
 def digits_only_padded(x, width: int):
     d = digits_only(x)
     if d == "":
@@ -102,6 +111,7 @@ def digits_only_padded(x, width: int):
     if len(d) < width:
         d = d.zfill(width)
     return d
+
 
 def try_parse_date(x):
     x = norm_blank(x)
@@ -117,6 +127,7 @@ def try_parse_date(x):
             return s
     return str(x)
 
+
 # include "priority" so 1 vs 1.0 doesn't mismatch
 NUMERIC_KEYWORDS = {"salary", "rate", "hours", "amount", "percent", "percentage", "priority"}
 DATE_KEYWORDS = {"date", "dob", "birth", "effective"}
@@ -128,11 +139,9 @@ DISTRIBUTION_KEYWORDS = {"distribution", "deposit type"}
 ROUTING_KEYWORDS = {"routing"}
 ACCOUNTNUM_KEYWORDS = {"account number"}
 
+
 def norm_phone_digits(x):
-    """
-    Normalize phone numbers so:
-      (410) 292-5939 == 4102925939
-    """
+    """Normalize phone numbers so (410) 292-5939 == 4102925939."""
     d = digits_only(x)
     if d == "":
         return ""
@@ -141,6 +150,7 @@ def norm_phone_digits(x):
     if len(d) > 10:
         d = d[-10:]
     return d
+
 
 def norm_zip_first5(x):
     x = norm_blank(x)
@@ -157,6 +167,7 @@ def norm_zip_first5(x):
     if 0 < len(s) < 5:
         s = s.zfill(5)
     return s[:5]
+
 
 def normalize_person_name(x: str) -> str:
     """
@@ -198,6 +209,7 @@ def normalize_person_name(x: str) -> str:
     last_name = toks[-1]
     return f"{first} {last_name}".casefold()
 
+
 def norm_distribution_token(val: str) -> str:
     """
     Normalize Paycheck Distribution / Deposit Type variants to two tokens:
@@ -209,16 +221,20 @@ def norm_distribution_token(val: str) -> str:
         return ""
     s = str(v).strip().casefold()
 
-    # UZIO variants
+    # UZIO variants for amount
+    if "flat dollar" in s or "flat amount" in s or "flat" in s and "dollar" in s:
+        return "amount"
+    if "dollar" in s and ("flat" in s or "amount" in s):
+        return "amount"
+
+    # Generic UZIO variants
     if "amount" in s:
         return "amount"
     if "%" in s or "percent" in s or "percentage" in s or "age" in s:
         return "percentage"
 
     # ADP variants
-    if "partial" in s and "%" in s:
-        return "percentage"
-    if "partial%" in s:
+    if ("partial" in s and "%" in s) or "partial%" in s:
         return "percentage"
     if "partial" in s:
         return "amount"
@@ -226,6 +242,7 @@ def norm_distribution_token(val: str) -> str:
         return "percentage"
 
     return re.sub(r"\s+", " ", s).strip()
+
 
 def norm_value(x, field_name: str):
     f = norm_colname(field_name).casefold()
@@ -269,6 +286,7 @@ def norm_value(x, field_name: str):
 
     return str(x).casefold()
 
+
 def norm_key_series(s: pd.Series) -> pd.Series:
     s2 = s.astype(object).where(~s.isna(), "")
     def _fix(v):
@@ -279,6 +297,7 @@ def norm_key_series(s: pd.Series) -> pd.Series:
         return v
     return s2.map(_fix)
 
+
 def find_col(df_cols, *candidate_names):
     norm_map = {norm_colname(c).casefold(): c for c in df_cols}
     for cand in candidate_names:
@@ -287,10 +306,11 @@ def find_col(df_cols, *candidate_names):
             return norm_map[key]
     return None
 
+
 def resolve_adp_col_label(label: str, adp_cols_all) -> str:
     """
     Resolve mapping sheet labels to actual ADP columns when possible.
-    If cannot resolve, we still keep the row as a constant: __CONST__:<label>
+    If cannot resolve, keep it as a constant: __CONST__:<label>
     """
     if label is None:
         return ""
@@ -323,10 +343,10 @@ def resolve_adp_col_label(label: str, adp_cols_all) -> str:
         if k_norm and (k_norm in direct or direct in k_norm):
             return actual
 
-    # treat as constant value
     return f"__CONST__:{raw}"
 
-# ---------- Payment normalization (business rule) ----------
+
+# ---------- Numeric helpers ----------
 def _safe_float(x):
     x = norm_blank(x)
     if x == "":
@@ -339,6 +359,16 @@ def _safe_float(x):
     except Exception:
         return np.nan
 
+
+def _is_blank_money_or_percent(v) -> bool:
+    s = str(norm_blank(v)).strip()
+    if s == "":
+        return True
+    s2 = s.replace("$", "").replace(",", "").replace("%", "").strip()
+    return s2 == ""
+
+
+# ---------- Payment normalization (business rule) ----------
 def normalize_adp_payment_table(adp_pay: pd.DataFrame, emp_col: str) -> pd.DataFrame:
     """
     Adds UZIO-like derived columns to ADP payment DF:
@@ -348,8 +378,8 @@ def normalize_adp_payment_table(adp_pay: pd.DataFrame, emp_col: str) -> pd.DataF
       - Priority (recomputed so FULL is last when mixed)
       - Payment Method (constant 'Direct Deposit')
 
-    Also applies:
-      - FULL + Partial => FULL least priority (last), Partial before it
+    Applies:
+      - FULL + Partial => FULL last, Partial before it
       - FULL + Partial% => FULL% = 100 - sum(Partial%); FULL last
     """
     df = adp_pay.copy()
@@ -359,32 +389,25 @@ def normalize_adp_payment_table(adp_pay: pd.DataFrame, emp_col: str) -> pd.DataF
     dep_amt_col = find_col(df.columns, "DEPOSIT AMOUNT", "Deposit Amount")
     prio_col = find_col(df.columns, "PRIORITY #", "Priority #", "PRIORITY")
 
-    # Create derived cols (ensure exist)
     df["Payment Method"] = "Direct Deposit"
     df["Paycheck Distribution"] = ""
     df["Paycheck Percentage"] = ""
     df["Paycheck Amount"] = ""
     df["Priority"] = ""
 
-    # fallback if deposit type column is missing
     if dep_type_col is None:
         return df
 
-    # stable row order within employee
     df["_row_ord"] = np.arange(len(df))
 
-    # group by employee
     for emp, g in df.groupby(emp_col, sort=False):
         idxs = list(g.index)
 
-        # classify rows
         cats = []
         orig_prios = []
         for i in idxs:
             dt = str(norm_blank(df.at[i, dep_type_col])).strip().casefold()
-            if "partial" in dt and "%" in dt:
-                cat = "partial_pct"
-            elif "partial%" in dt:
+            if ("partial" in dt and "%" in dt) or "partial%" in dt:
                 cat = "partial_pct"
             elif "partial" in dt:
                 cat = "partial_amt"
@@ -399,7 +422,6 @@ def normalize_adp_payment_table(adp_pay: pd.DataFrame, emp_col: str) -> pd.DataF
                 p = _safe_float(df.at[i, prio_col])
             orig_prios.append(p)
 
-        # compute FULL percent if needed
         has_partial_pct = any(c == "partial_pct" for c in cats)
         sum_partial_pct = 0.0
         if has_partial_pct and dep_pct_col is not None:
@@ -410,7 +432,6 @@ def normalize_adp_payment_table(adp_pay: pd.DataFrame, emp_col: str) -> pd.DataF
                         sum_partial_pct += v
         full_pct = max(0.0, 100.0 - sum_partial_pct) if has_partial_pct else 100.0
 
-        # compute derived distribution/amount/percent per row
         for i, c in zip(idxs, cats):
             if c == "partial_amt":
                 df.at[i, "Paycheck Distribution"] = "amount"
@@ -425,7 +446,6 @@ def normalize_adp_payment_table(adp_pay: pd.DataFrame, emp_col: str) -> pd.DataF
                 df.at[i, "Paycheck Percentage"] = full_pct
                 df.at[i, "Paycheck Amount"] = ""
             else:
-                # fallback (best-effort)
                 pct = df.at[i, dep_pct_col] if dep_pct_col is not None else ""
                 amt = df.at[i, dep_amt_col] if dep_amt_col is not None else ""
                 if norm_blank(pct) != "":
@@ -442,23 +462,72 @@ def normalize_adp_payment_table(adp_pay: pd.DataFrame, emp_col: str) -> pd.DataF
                     df.at[i, "Paycheck Percentage"] = ""
 
         # recompute priorities: partial_amt -> partial_pct -> full -> other
-        def _sort_key(i, cat, orig_p):
-            # NaN original priority goes last within category
+        def _sort_key(i, orig_p):
             pkey = orig_p if not np.isnan(orig_p) else 1e18
             return (pkey, int(df.at[i, "_row_ord"]))
 
         ordered = []
         for cat_name in ["partial_amt", "partial_pct", "full", "other"]:
-            bucket = [(i, cat, op) for i, cat, op in zip(idxs, cats, orig_prios) if cat == cat_name]
-            bucket_sorted = sorted(bucket, key=lambda t: _sort_key(t[0], t[1], t[2]))
+            bucket = [(i, op) for i, cat, op in zip(idxs, cats, orig_prios) if cat == cat_name]
+            bucket_sorted = sorted(bucket, key=lambda t: _sort_key(t[0], t[1]))
             ordered.extend([t[0] for t in bucket_sorted])
 
-        # assign sequential priorities
         for new_p, i in enumerate(ordered, start=1):
             df.at[i, "Priority"] = new_p
 
     df.drop(columns=["_row_ord"], inplace=True, errors="ignore")
     return df
+
+
+def normalize_uzio_payment_full_inference(uzio_pay: pd.DataFrame, emp_col: str) -> pd.DataFrame:
+    """
+    If employee has multiple payment rows and exactly one row has BOTH
+    Paycheck Amount blank AND Paycheck Percentage blank:
+      - treat it as FULL/remainder row
+      - set Paycheck Distribution to 'Percentage'
+      - set Paycheck Percentage = 100 - sum(other partial% rows) (else 100)
+    """
+    df = uzio_pay.copy()
+
+    dist_col = find_col(df.columns, "Paycheck Distribution", "Deposit Type")
+    pct_col = find_col(df.columns, "Paycheck Percentage", "Deposit Percent")
+    amt_col = find_col(df.columns, "Paycheck Amount", "Deposit Amount")
+
+    if dist_col is None or pct_col is None or amt_col is None:
+        return df
+
+    for emp, g in df.groupby(emp_col, sort=False):
+        if len(g) < 2:
+            continue
+
+        # candidate rows where both amount and percent are blank
+        candidate_idxs = []
+        for i in g.index:
+            if _is_blank_money_or_percent(df.at[i, amt_col]) and _is_blank_money_or_percent(df.at[i, pct_col]):
+                candidate_idxs.append(i)
+
+        if len(candidate_idxs) != 1:
+            continue
+
+        full_idx = candidate_idxs[0]
+
+        # compute sum of partial percentages (rows with pct not blank)
+        sum_partial_pct = 0.0
+        for i in g.index:
+            if i == full_idx:
+                continue
+            v = _safe_float(df.at[i, pct_col])
+            if not np.isnan(v):
+                sum_partial_pct += v
+
+        full_pct = max(0.0, 100.0 - sum_partial_pct) if sum_partial_pct > 0 else 100.0
+
+        # update inferred full row
+        df.at[full_idx, dist_col] = "Percentage"
+        df.at[full_idx, pct_col] = full_pct
+
+    return df
+
 
 # ---------- Record key builders ----------
 def build_payment_base_key(df: pd.DataFrame, emp_col: str):
@@ -483,6 +552,7 @@ def build_payment_base_key(df: pd.DataFrame, emp_col: str):
 
     return df.apply(_row_key, axis=1)
 
+
 def build_contact_base_key(df: pd.DataFrame, emp_col: str):
     name_col = find_col(df.columns, "Contact Name", "NAME", "Name")
     phone_col = find_col(df.columns, "Mobile Phone", "Phone", "MOBILE PHONE")
@@ -496,6 +566,7 @@ def build_contact_base_key(df: pd.DataFrame, emp_col: str):
         return f"{emp}|{nm}|{ph}|{rl}"
 
     return df.apply(_row_key, axis=1)
+
 
 def filter_section_rows(uzio_df: pd.DataFrame, section: str):
     """UZIO sheet may contain both sections; infer by which fields are populated."""
@@ -520,12 +591,14 @@ def filter_section_rows(uzio_df: pd.DataFrame, section: str):
         mask = mask | (uzio_df[c].map(norm_blank) != "")
     return uzio_df[mask].copy()
 
+
 def group_indices(df: pd.DataFrame):
     g = {}
     for idx, k in df["_base_key"].items():
         k2 = "" if norm_blank(k) == "" else str(k)
         g.setdefault(k2, []).append(idx)
     return g
+
 
 def read_mapping_sheet(xls: pd.ExcelFile, sheet_name: str, adp_all_cols: list) -> pd.DataFrame:
     m = pd.read_excel(xls, sheet_name=sheet_name, dtype=object)
@@ -559,7 +632,8 @@ def read_mapping_sheet(xls: pd.ExcelFile, sheet_name: str, adp_all_cols: list) -
 
     return m
 
-# ---------- Field Summary cleanup (remove specific columns by name) ----------
+
+# ---------- Field Summary cleanup ----------
 def drop_unwanted_field_summary_columns(field_summary_df: pd.DataFrame) -> pd.DataFrame:
     if field_summary_df is None or field_summary_df.empty:
         return field_summary_df
@@ -568,6 +642,7 @@ def drop_unwanted_field_summary_columns(field_summary_df: pd.DataFrame) -> pd.Da
     if existing:
         field_summary_df = field_summary_df.drop(columns=existing)
     return field_summary_df
+
 
 # ---------- Core comparison ----------
 def run_comparison(file_bytes: bytes) -> dict:
@@ -588,7 +663,6 @@ def run_comparison(file_bytes: bytes) -> dict:
 
     ADP_PAY_KEY = find_col(adp_pay_raw.columns, "ASSOCIATE ID", "Associate ID")
     ADP_EC_KEY = find_col(adp_ec.columns, "ASSOCIATE ID", "Associate ID")
-
     if ADP_PAY_KEY is None:
         raise ValueError("ADP Payment Data must contain 'ASSOCIATE ID' (or 'Associate ID').")
     if ADP_EC_KEY is None:
@@ -599,42 +673,57 @@ def run_comparison(file_bytes: bytes) -> dict:
     adp_pay_raw[ADP_PAY_KEY] = norm_key_series(adp_pay_raw[ADP_PAY_KEY])
     adp_ec[ADP_EC_KEY] = norm_key_series(adp_ec[ADP_EC_KEY])
 
-    # mapping sheets (separate)
+    # mapping sheets
     adp_all_cols = list(adp_pay_raw.columns) + list(adp_ec.columns)
     pay_map = read_mapping_sheet(xls, PAY_MAP_SHEET, adp_all_cols)
     ec_map = read_mapping_sheet(xls, EC_MAP_SHEET, adp_all_cols)
 
-    # Apply payment business-rule override: compare these UZIO fields against derived ADP columns
-    payment_derived_fields = {"Paycheck Distribution", "Paycheck Percentage", "Paycheck Amount", "Priority", "Payment Method"}
+    # Derived fields for payment are compared against ADP-normalized columns
+    payment_derived_fields = {
+        "Paycheck Distribution",
+        "Paycheck Percentage",
+        "Paycheck Amount",
+        "Priority",
+        "Payment Method",
+    }
     pay_map.loc[pay_map["UZIO_Column"].isin(payment_derived_fields), "ADP_Resolved_Column"] = pay_map.loc[
         pay_map["UZIO_Column"].isin(payment_derived_fields), "UZIO_Column"
     ]
 
-    # Normalize ADP payment table with business rules
+    # Normalize ADP payment table (business rule)
     adp_pay = normalize_adp_payment_table(adp_pay_raw, ADP_PAY_KEY)
 
     # split UZIO data
     uzio_pay = filter_section_rows(uzio, "Payment")
     uzio_ec = filter_section_rows(uzio, "Emergency Contact")
 
-    # base keys
+    # NEW: infer UZIO FULL row when amount+percent both blank for exactly one row
+    if len(uzio_pay):
+        uzio_pay = normalize_uzio_payment_full_inference(uzio_pay, UZIO_KEY)
+
+    # base keys (support duplicates)
     uzio_pay["_base_key"] = build_payment_base_key(uzio_pay, UZIO_KEY) if len(uzio_pay) else pd.Series(dtype=str)
     adp_pay["_base_key"] = build_payment_base_key(adp_pay, ADP_PAY_KEY)
 
     uzio_ec["_base_key"] = build_contact_base_key(uzio_ec, UZIO_KEY) if len(uzio_ec) else pd.Series(dtype=str)
     adp_ec["_base_key"] = build_contact_base_key(adp_ec, ADP_EC_KEY)
 
-    # groupings (support duplicates)
     g_uz_pay = group_indices(uzio_pay) if len(uzio_pay) else {}
     g_ad_pay = group_indices(adp_pay)
     g_uz_ec = group_indices(uzio_ec) if len(uzio_ec) else {}
     g_ad_ec = group_indices(adp_ec)
 
-    def build_report_for_section(section: str, uz_df: pd.DataFrame, ad_df: pd.DataFrame,
-                                 g_uz: dict, g_ad: dict, emp_key_uz: str, emp_key_ad: str,
-                                 mapping_df: pd.DataFrame) -> bytes:
+    def build_report_for_section(
+        section: str,
+        uz_df: pd.DataFrame,
+        ad_df: pd.DataFrame,
+        g_uz: dict,
+        g_ad: dict,
+        emp_key_uz: str,
+        emp_key_ad: str,
+        mapping_df: pd.DataFrame,
+    ) -> bytes:
 
-        # include rows even if they map to constants
         sec_map = mapping_df.copy()
         sec_map = sec_map[sec_map["ADP_Resolved_Column"].map(norm_blank) != ""].copy()
 
@@ -675,7 +764,6 @@ def run_comparison(file_bytes: bytes) -> dict:
 
                     uz_val = uz_df.loc[uz_idx, uz_field] if (uz_idx is not None and uz_field in uz_df.columns) else ""
 
-                    # ADP value: column or constant
                     if isinstance(adp_col_resolved, str) and adp_col_resolved.startswith("__CONST__:"):
                         adp_val = adp_col_resolved.split(":", 1)[1]
                         adp_col_missing = False
@@ -808,7 +896,6 @@ def run_comparison(file_bytes: bytes) -> dict:
             summary.to_excel(writer, sheet_name="Summary", index=False)
             field_summary_by_status.to_excel(writer, sheet_name="Field_Summary_By_Status", index=False)
             comparison_detail.to_excel(writer, sheet_name="Comparison_Detail_AllFields", index=False)
-            # removed sheets (per request): Mismatches_Only, Mapping_ADP_Col_Missing
 
         return out.getvalue()
 
@@ -835,6 +922,7 @@ def run_comparison(file_bytes: bytes) -> dict:
     )
 
     return {"payment": payment_bytes, "emergency_contact": emergency_contact_bytes}
+
 
 # ---------- UI ----------
 st.title(APP_TITLE)
@@ -869,7 +957,7 @@ if run_btn:
                 data=reports["emergency_contact"],
                 file_name=ec_name,
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                type="secondary",
+                type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
     except Exception as e:
         st.error(f"Failed: {e}")
