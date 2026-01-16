@@ -333,29 +333,30 @@ def resolve_adp_col_label(label: str, adp_cols_all) -> str:
     if direct in adp_norm:
         return adp_norm[direct]
 
+    # If mapping has patterns like: ASSOCIATE ID (or "Associate ID")
     parts = re.split(r"\(|\)|\bor\b|/|,|;", raw, flags=re.IGNORECASE)
     parts = [norm_colname(p) for p in parts if norm_colname(p)]
 
+    # Also split patterns like "SV1 - savings"
     extra = []
     for p in parts:
         extra.extend([norm_colname(x) for x in re.split(r"\s[-–]\s", p) if norm_colname(x)])
     parts = parts + extra
 
-    for p in parts:
-        k = norm_colname(p).casefold()
-        if k in adp_norm:
-            return actual_col
-        # (bug safety: will continue; but we handle below)
+    # Try exact matches for each part
     for p in parts:
         k = norm_colname(p).casefold()
         if k in adp_norm:
             return adp_norm[k]
 
+    # Try contains match
     for k_norm, actual in adp_norm.items():
         if k_norm and (k_norm in direct or direct in k_norm):
             return actual
 
+    # Otherwise treat as constant
     return f"__CONST__:{raw}"
+
 
 
 # ---------- Numeric helpers ----------
