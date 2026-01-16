@@ -19,24 +19,32 @@ import streamlit as st
 #
 # OUTPUT (two independent reports):
 #   - Summary
-#   - Field_Summary_By_Status   (columns removed: MISSING_IN_ADP, ADP_COLUMN_MISSING, UZIO_COLUMN_MISSING)
-#   - Comparison_Detail_AllFields (NO FieldKey column)
+#   - Field_Summary_By_Status
+#       (columns removed: MISSING_IN_ADP, ADP_COLUMN_MISSING, UZIO_COLUMN_MISSING)
+#   - Comparison_Detail_AllFields
+#       (NO FieldKey column)
 #
-# PAYMENT BUSINESS RULE (ADP -> UZIO-like normalization):
-#   - FULL => percentage based
-#   - Partial => amount based
-#   - Partial% => percentage based
-#   - Full + Partial => Full is last priority, Partial accounts before it
-#   - Full + Partial% => Full% = 100 - sum(Partial%); Full is last priority
-#
-# ADDITIONAL FIXES:
-#   1) UZIO "Flat Dollar" distribution is treated as "amount" (so no mismatch with ADP "amount")
-#   2) UZIO FULL-row inference:
-#        if an employee has multiple payment rows and exactly one row has BOTH
-#        Paycheck Amount blank AND Paycheck Percentage blank,
-#        treat that row as FULL/remainder:
-#          - set Paycheck Distribution to "Percentage"
-#          - set Paycheck Percentage to 100 - sum(other partial% if any), else 100
+# FIXES / RULES INCLUDED:
+# 1) Phone normalization: (410) 292-5939 == 4102925939
+# 2) Name normalization: "Bell, Ronald" == "Ronald Bell"
+#    Compares FIRST + LAST only (ignores middle names)
+# 3) Paycheck Distribution normalization:
+#    UZIO "Flat Dollar" treated as "amount"
+# 4) UZIO FULL-row inference:
+#    If employee has multiple payment rows and exactly one row has BOTH
+#    Paycheck Amount blank AND Paycheck Percentage blank,
+#    treat it as FULL/remainder:
+#      - set Paycheck Distribution to "Percentage"
+#      - set Paycheck Percentage to 100 - sum(other partial% if any), else 100
+# 5) ADP payment business rule normalization:
+#    - FULL => percentage + 100 (or remainder when Partial% exists)
+#    - Partial => amount
+#    - Partial% => percentage
+#    - Full + Partial => Full is last priority (Partial accounts before it)
+#    - Full + Partial% => Full% = 100 - sum(Partial%); Full last priority
+# 6) Remove sheets from output:
+#    - Mismatches_Only (not created)
+#    - Mapping_ADP_Col_Missing (not created)
 # =========================================================
 
 APP_TITLE = "UZIO vs ADP – Payment & Emergency Contact Comparison Tool"
@@ -128,7 +136,6 @@ def try_parse_date(x):
     return str(x)
 
 
-# include "priority" so 1 vs 1.0 doesn't mismatch
 NUMERIC_KEYWORDS = {"salary", "rate", "hours", "amount", "percent", "percentage", "priority"}
 DATE_KEYWORDS = {"date", "dob", "birth", "effective"}
 ZIP_KEYWORDS = {"zip", "zipcode", "postal"}
@@ -222,7 +229,7 @@ def norm_distribution_token(val: str) -> str:
     s = str(v).strip().casefold()
 
     # UZIO variants for amount
-    if "flat dollar" in s or "flat amount" in s or "flat" in s and "dollar" in s:
+    if "flat dollar" in s or "flat amount" in s or ("flat" in s and "dollar" in s):
         return "amount"
     if "dollar" in s and ("flat" in s or "amount" in s):
         return "amount"
@@ -337,6 +344,11 @@ def resolve_adp_col_label(label: str, adp_cols_all) -> str:
     for p in parts:
         k = norm_colname(p).casefold()
         if k in adp_norm:
+            return actual_col
+        # (bug safety: will continue; but we handle below)
+    for p in parts:
+        k = norm_colname(p).casefold()
+        if k in adp_norm:
             return adp_norm[k]
 
     for k_norm, actual in adp_norm.items():
@@ -377,10 +389,6 @@ def normalize_adp_payment_table(adp_pay: pd.DataFrame, emp_col: str) -> pd.DataF
       - Paycheck Amount
       - Priority (recomputed so FULL is last when mixed)
       - Payment Method (constant 'Direct Deposit')
-
-    Applies:
-      - FULL + Partial => FULL last, Partial before it
-      - FULL + Partial% => FULL% = 100 - sum(Partial%); FULL last
     """
     df = adp_pay.copy()
 
@@ -500,7 +508,6 @@ def normalize_uzio_payment_full_inference(uzio_pay: pd.DataFrame, emp_col: str) 
         if len(g) < 2:
             continue
 
-        # candidate rows where both amount and percent are blank
         candidate_idxs = []
         for i in g.index:
             if _is_blank_money_or_percent(df.at[i, amt_col]) and _is_blank_money_or_percent(df.at[i, pct_col]):
@@ -511,7 +518,6 @@ def normalize_uzio_payment_full_inference(uzio_pay: pd.DataFrame, emp_col: str) 
 
         full_idx = candidate_idxs[0]
 
-        # compute sum of partial percentages (rows with pct not blank)
         sum_partial_pct = 0.0
         for i in g.index:
             if i == full_idx:
@@ -522,7 +528,6 @@ def normalize_uzio_payment_full_inference(uzio_pay: pd.DataFrame, emp_col: str) 
 
         full_pct = max(0.0, 100.0 - sum_partial_pct) if sum_partial_pct > 0 else 100.0
 
-        # update inferred full row
         df.at[full_idx, dist_col] = "Percentage"
         df.at[full_idx, pct_col] = full_pct
 
@@ -656,7 +661,6 @@ def run_comparison(file_bytes: bytes) -> dict:
     adp_pay_raw.columns = [norm_colname(c) for c in adp_pay_raw.columns]
     adp_ec.columns = [norm_colname(c) for c in adp_ec.columns]
 
-    # keys
     UZIO_KEY = find_col(uzio.columns, "Employee ID", "EmployeeID", "Employee Id")
     if UZIO_KEY is None:
         raise ValueError("UZIO key column 'Employee ID' not found in 'Uzio Data' tab.")
@@ -668,17 +672,14 @@ def run_comparison(file_bytes: bytes) -> dict:
     if ADP_EC_KEY is None:
         raise ValueError("ADP Emergency Contact Data must contain 'ASSOCIATE ID' (or 'Associate ID').")
 
-    # normalize keys
     uzio[UZIO_KEY] = norm_key_series(uzio[UZIO_KEY])
     adp_pay_raw[ADP_PAY_KEY] = norm_key_series(adp_pay_raw[ADP_PAY_KEY])
     adp_ec[ADP_EC_KEY] = norm_key_series(adp_ec[ADP_EC_KEY])
 
-    # mapping sheets
     adp_all_cols = list(adp_pay_raw.columns) + list(adp_ec.columns)
     pay_map = read_mapping_sheet(xls, PAY_MAP_SHEET, adp_all_cols)
     ec_map = read_mapping_sheet(xls, EC_MAP_SHEET, adp_all_cols)
 
-    # Derived fields for payment are compared against ADP-normalized columns
     payment_derived_fields = {
         "Paycheck Distribution",
         "Paycheck Percentage",
@@ -690,18 +691,14 @@ def run_comparison(file_bytes: bytes) -> dict:
         pay_map["UZIO_Column"].isin(payment_derived_fields), "UZIO_Column"
     ]
 
-    # Normalize ADP payment table (business rule)
     adp_pay = normalize_adp_payment_table(adp_pay_raw, ADP_PAY_KEY)
 
-    # split UZIO data
     uzio_pay = filter_section_rows(uzio, "Payment")
     uzio_ec = filter_section_rows(uzio, "Emergency Contact")
 
-    # NEW: infer UZIO FULL row when amount+percent both blank for exactly one row
     if len(uzio_pay):
         uzio_pay = normalize_uzio_payment_full_inference(uzio_pay, UZIO_KEY)
 
-    # base keys (support duplicates)
     uzio_pay["_base_key"] = build_payment_base_key(uzio_pay, UZIO_KEY) if len(uzio_pay) else pd.Series(dtype=str)
     adp_pay["_base_key"] = build_payment_base_key(adp_pay, ADP_PAY_KEY)
 
@@ -739,7 +736,6 @@ def run_comparison(file_bytes: bytes) -> dict:
                 uz_idx = uz_list[i] if i < len(uz_list) else None
                 ad_idx = ad_list[i] if i < len(ad_list) else None
 
-                # employee id output
                 employee_id_out = ""
                 try:
                     if uz_idx is not None and emp_key_uz in uz_df.columns:
@@ -957,7 +953,8 @@ if run_btn:
                 data=reports["emergency_contact"],
                 file_name=ec_name,
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                type="primary",
             )
+
     except Exception as e:
         st.error(f"Failed: {e}")
