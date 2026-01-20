@@ -449,6 +449,45 @@ def _is_blank_money_or_percent(v) -> bool:
     return s2 == ""
 
 
+def _safe_percentage(x):
+    """
+    Parse percentage value, handling:
+    - '20%' -> 20.0
+    - 0.2 -> 20.0 (if <= 1.0, scale up)
+    """
+    x = norm_blank(x)
+    if x == "":
+        return np.nan
+    try:
+        # Handle string with %
+        if isinstance(x, str):
+            s = x.strip().replace(",", "").replace("$", "")
+            if "%" in s:
+                s = s.replace("%", "")
+                return float(s)
+            
+            # If string without %, parse float
+            f = float(s)
+            # Scaling check for string inputs? 
+            # E.g. "0.2" -> 20? 
+            # Safer to assume if user types "0.2" they might mean 0.2%, 
+            # BUT consistent with Excel logic, let's treat <= 1.0 as x100
+            if 0 < abs(f) <= 1.0:
+                 return f * 100.0
+            return f
+
+        if isinstance(x, (int, float, np.integer, np.floating)):
+            f = float(x)
+            if 0 < abs(f) <= 1.0:
+                return f * 100.0
+            return f
+            
+        return np.nan
+    except Exception:
+        return np.nan
+
+
+
 # ---------- Payment normalization (business rule) ----------
 def normalize_adp_payment_table(adp_pay: pd.DataFrame, emp_col: str) -> pd.DataFrame:
     """
@@ -504,7 +543,7 @@ def normalize_adp_payment_table(adp_pay: pd.DataFrame, emp_col: str) -> pd.DataF
         if has_partial_pct and dep_pct_col is not None:
             for i, c in zip(idxs, cats):
                 if c == "partial_pct":
-                    v = _safe_float(df.at[i, dep_pct_col])
+                    v = _safe_percentage(df.at[i, dep_pct_col])
                     if not np.isnan(v):
                         sum_partial_pct += v
         full_pct = max(0.0, 100.0 - sum_partial_pct) if has_partial_pct else 100.0
@@ -516,7 +555,9 @@ def normalize_adp_payment_table(adp_pay: pd.DataFrame, emp_col: str) -> pd.DataF
                 df.at[i, "Paycheck Percentage"] = ""
             elif c == "partial_pct":
                 df.at[i, "Paycheck Distribution"] = "percentage"
-                df.at[i, "Paycheck Percentage"] = df.at[i, dep_pct_col] if dep_pct_col is not None else ""
+                # Use cleaned percentage for stored value too
+                val = _safe_percentage(df.at[i, dep_pct_col])
+                df.at[i, "Paycheck Percentage"] = val if not np.isnan(val) else ""
                 df.at[i, "Paycheck Amount"] = ""
             elif c == "full":
                 df.at[i, "Paycheck Distribution"] = "percentage"
@@ -527,7 +568,9 @@ def normalize_adp_payment_table(adp_pay: pd.DataFrame, emp_col: str) -> pd.DataF
                 amt = df.at[i, dep_amt_col] if dep_amt_col is not None else ""
                 if norm_blank(pct) != "":
                     df.at[i, "Paycheck Distribution"] = "percentage"
-                    df.at[i, "Paycheck Percentage"] = pct
+                    val = _safe_percentage(pct)
+                    df.at[i, "Paycheck Percentage"] = val if not np.isnan(val) else pct
+
                     df.at[i, "Paycheck Amount"] = ""
                 elif norm_blank(amt) != "":
                     df.at[i, "Paycheck Distribution"] = "amount"
