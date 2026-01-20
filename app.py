@@ -251,6 +251,25 @@ def norm_distribution_token(val: str) -> str:
     return re.sub(r"\s+", " ", s).strip()
 
 
+def norm_account_type(x: str) -> str:
+    """
+    Normalize Account Type to handle ADP codes:
+      - 'CK1 - checking' -> 'checking'
+      - 'SV1 - savings' -> 'savings'
+      - 'Checking' -> 'checking'
+    """
+    s = str(norm_blank(x)).strip().casefold()
+    if s == "":
+        return ""
+    # Strip prefix like "ck1 - " or "sv2 - "
+    # Regex look for: start, optional alphanumeric, optional space, hyphen, space, then capture rest
+    m = re.match(r"^(?:ck|sv)\d*\s*[-–]\s*(.*)", s)
+    if m:
+        return m.group(1).strip()
+    return s
+
+
+
 def norm_value(x, field_name: str):
     f = norm_colname(field_name).casefold()
     x = norm_blank(x)
@@ -278,7 +297,20 @@ def norm_value(x, field_name: str):
     if any(k in f for k in DISTRIBUTION_KEYWORDS):
         return norm_distribution_token(x)
 
+    # Added: Account Type specific normalization
+    if "account" in f and "type" in f:
+        return norm_account_type(x)
+
     if any(k in f for k in NUMERIC_KEYWORDS):
+        # Added: Percentage handling (strip % and parse as is, do not div by 100)
+        s_raw = str(x).strip()
+        if "%" in s_raw:
+            s_clean = s_raw.replace("%", "").strip()
+            try:
+                return float(s_clean)
+            except:
+                pass
+
         if isinstance(x, (int, float, np.integer, np.floating)):
             return float(x)
         if isinstance(x, str):
@@ -535,6 +567,33 @@ def normalize_uzio_payment_full_inference(uzio_pay: pd.DataFrame, emp_col: str) 
     return df
 
 
+def normalize_uzio_payment_priority(uzio_pay: pd.DataFrame, emp_col: str) -> pd.DataFrame:
+    """
+    Infers Priority for Uzio records:
+      - If Priority is blank AND employee has exactly 1 row -> set Priority = 1
+    """
+    df = uzio_pay.copy()
+    prio_col = find_col(df.columns, "Priority", "Priority #")
+    
+    # If column doesn't exist, create it
+    if prio_col is None:
+        prio_col = "Priority"
+        df[prio_col] = ""
+    
+    # Ensure it's treated as string/object to mix int/str if needed
+    df[prio_col] = df[prio_col].astype(object)
+
+    for emp, g in df.groupby(emp_col, sort=False):
+        # Case: Single row
+        if len(g) == 1:
+            curr_val = norm_blank(df.at[g.index[0], prio_col])
+            if curr_val == "":
+                df.at[g.index[0], prio_col] = 1
+    
+    return df
+
+
+
 # ---------- Record key builders ----------
 def build_payment_base_key(df: pd.DataFrame, emp_col: str):
     routing_col = find_col(df.columns, "ROUTING NUMBER", "Routing Number")
@@ -699,6 +758,7 @@ def run_comparison(file_bytes: bytes) -> dict:
 
     if len(uzio_pay):
         uzio_pay = normalize_uzio_payment_full_inference(uzio_pay, UZIO_KEY)
+        uzio_pay = normalize_uzio_payment_priority(uzio_pay, UZIO_KEY)
 
     uzio_pay["_base_key"] = build_payment_base_key(uzio_pay, UZIO_KEY) if len(uzio_pay) else pd.Series(dtype=str)
     adp_pay["_base_key"] = build_payment_base_key(adp_pay, ADP_PAY_KEY)
