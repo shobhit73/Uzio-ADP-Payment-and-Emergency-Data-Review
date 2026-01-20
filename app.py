@@ -326,6 +326,42 @@ def norm_value(x, field_name: str):
     return str(x).casefold()
 
 
+def is_fuzzy_match(v1, v2) -> bool:
+    """
+    Compare two values allowing for:
+    1. Exact equality
+    2. Float tolerance (e.g. 99.8 vs 99.80001)
+    3. Percentage scaling (e.g. 20 vs 0.2, or 0.03 vs 3)
+    """
+    if v1 == v2:
+        return True
+    if v1 == "" or v2 == "":
+        return False
+    
+    # Try float comparison
+    try:
+        f1 = float(v1)
+        f2 = float(v2)
+        
+        # Tolerance check
+        if abs(f1 - f2) < 0.01:
+            return True
+        
+        # Scaling check (x100)
+        # Check if f1 is approx f2 * 100
+        if abs(f1 - (f2 * 100.0)) < 0.01:
+            return True
+        # Check if f2 is approx f1 * 100
+        if abs(f2 - (f1 * 100.0)) < 0.01:
+            return True
+            
+    except:
+        pass
+        
+    return False
+
+
+
 def norm_key_series(s: pd.Series) -> pd.Series:
     s2 = s.astype(object).where(~s.isna(), "")
     def _fix(v):
@@ -840,7 +876,7 @@ def run_comparison(file_bytes: bytes) -> dict:
                         uz_n = norm_value(uz_val, uz_field)
                         ad_n = norm_value(adp_val, uz_field)
 
-                        if (uz_n == ad_n) or (uz_n == "" and ad_n == ""):
+                        if is_fuzzy_match(uz_n, ad_n):
                             status = "OK"
                         elif uz_n == "" and ad_n != "":
                             status = "UZIO_MISSING_VALUE"
