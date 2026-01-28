@@ -781,7 +781,8 @@ def read_mapping_sheet(xls: pd.ExcelFile, sheet_name: str, adp_all_cols: list) -
 def drop_unwanted_field_summary_columns(field_summary_df: pd.DataFrame) -> pd.DataFrame:
     if field_summary_df is None or field_summary_df.empty:
         return field_summary_df
-    cols_to_drop = ["MISSING_IN_ADP", "ADP_COLUMN_MISSING", "UZIO_COLUMN_MISSING"]
+    # Updated to new status names
+    cols_to_drop = ["Employee ID Not Found in ADP", "Column Missing in ADP Sheet", "Column Missing in Uzio Sheet"]
     existing = [c for c in cols_to_drop if c in field_summary_df.columns]
     if existing:
         field_summary_df = field_summary_df.drop(columns=existing)
@@ -908,25 +909,25 @@ def run_comparison(file_bytes: bytes) -> dict:
                         adp_val = ad_df.loc[ad_idx, adp_col_resolved] if (ad_idx is not None and not adp_col_missing) else ""
 
                     if ad_idx is None and uz_idx is not None:
-                        status = "MISSING_IN_ADP"
+                        status = "Employee ID Not Found in ADP"
                     elif ad_idx is not None and uz_idx is None:
-                        status = "MISSING_IN_UZIO"
+                        status = "Employee ID Not Found in Uzio"
                     elif adp_col_missing:
-                        status = "ADP_COLUMN_MISSING"
+                        status = "Column Missing in ADP Sheet"
                     elif uz_field not in uz_df.columns:
-                        status = "UZIO_COLUMN_MISSING"
+                        status = "Column Missing in Uzio Sheet"
                     else:
                         uz_n = norm_value(uz_val, uz_field)
                         ad_n = norm_value(adp_val, uz_field)
 
                         if is_fuzzy_match(uz_n, ad_n):
-                            status = "OK"
+                            status = "Data Match"
                         elif uz_n == "" and ad_n != "":
-                            status = "UZIO_MISSING_VALUE"
+                            status = "Value missing in Uzio (ADP has value)"
                         elif uz_n != "" and ad_n == "":
-                            status = "ADP_MISSING_VALUE"
+                            status = "Value missing in ADP (Uzio has value)"
                         else:
-                            status = "MISMATCH"
+                            status = "Data Mismatch"
 
                     rows.append(
                         {
@@ -949,14 +950,14 @@ def run_comparison(file_bytes: bytes) -> dict:
             comparison_detail["_FieldKey"] = comparison_detail["Section"] + " :: " + comparison_detail["Field"]
 
             statuses = [
-                "OK",
-                "MISMATCH",
-                "UZIO_MISSING_VALUE",
-                "ADP_MISSING_VALUE",
-                "MISSING_IN_UZIO",
-                "MISSING_IN_ADP",
-                "ADP_COLUMN_MISSING",
-                "UZIO_COLUMN_MISSING",
+                "Data Match",
+                "Data Mismatch",
+                "Value missing in Uzio (ADP has value)",
+                "Value missing in ADP (Uzio has value)",
+                "Employee ID Not Found in Uzio",
+                "Employee ID Not Found in ADP",
+                "Column Missing in ADP Sheet",
+                "Column Missing in Uzio Sheet",
             ]
             field_summary_by_status = (
                 comparison_detail.pivot_table(
@@ -975,14 +976,14 @@ def run_comparison(file_bytes: bytes) -> dict:
             field_summary_by_status = pd.DataFrame(
                 columns=[
                     "Field",
-                    "OK",
-                    "MISMATCH",
-                    "UZIO_MISSING_VALUE",
-                    "ADP_MISSING_VALUE",
-                    "MISSING_IN_UZIO",
-                    "MISSING_IN_ADP",
-                    "ADP_COLUMN_MISSING",
-                    "UZIO_COLUMN_MISSING",
+                    "Data Match",
+                    "Data Mismatch",
+                    "Value missing in Uzio (ADP has value)",
+                    "Value missing in ADP (Uzio has value)",
+                    "Employee ID Not Found in Uzio",
+                    "Employee ID Not Found in ADP",
+                    "Column Missing in ADP Sheet",
+                    "Column Missing in Uzio Sheet",
                     "Total",
                 ]
             )
