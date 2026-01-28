@@ -70,7 +70,14 @@ st.markdown(
 )
 
 # ---------- Helpers ----------
+# ---------- Helpers ----------
 def norm_colname(c: str) -> str:
+    """
+    Normalize column names to a standard format for easier matching.
+    - Replaces newlines and non-breaking spaces with standard spaces.
+    - Standardizes quotes (single and double).
+    - Removes extra whitespace and asterisks.
+    """
     if c is None:
         return ""
     c = str(c).replace("\n", " ").replace("\r", " ")
@@ -83,6 +90,10 @@ def norm_colname(c: str) -> str:
 
 
 def norm_blank(x):
+    """
+    Normalize blank values (None, NaN, empty strings, 'null', 'nan') to an empty string.
+    This ensures consistent handling of missing data.
+    """
     if x is None:
         return ""
     if isinstance(x, float) and np.isnan(x):
@@ -271,6 +282,14 @@ def norm_account_type(x: str) -> str:
 
 
 def norm_value(x, field_name: str):
+    """
+    Master normalization function that applies specific rules based on the field name.
+    - Phones: digits only, last 10 digits
+    - Zips: first 5 digits
+    - Dates: standard YYYY-MM-DD
+    - Names: First Last (ignore middle)
+    - Accounts: Remove special chars
+    """
     f = norm_colname(field_name).casefold()
     x = norm_blank(x)
     if x == "":
@@ -374,6 +393,10 @@ def norm_key_series(s: pd.Series) -> pd.Series:
 
 
 def find_col(df_cols, *candidate_names):
+    """
+    Search for a column name in a dataframe given a list of candidate names.
+    Returns the actual column name if found, else None.
+    """
     norm_map = {norm_colname(c).casefold(): c for c in df_cols}
     for cand in candidate_names:
         key = norm_colname(cand).casefold()
@@ -478,6 +501,8 @@ def _safe_percentage(x):
 
         if isinstance(x, (int, float, np.integer, np.floating)):
             f = float(x)
+            # Assumption: If percentage is <= 1.0 (e.g., 0.2), treat it as 20%.
+            # This handles Excel formatting where 20% is stored as 0.2.
             if 0 < abs(f) <= 1.0:
                 return f * 100.0
             return f
@@ -581,7 +606,11 @@ def normalize_adp_payment_table(adp_pay: pd.DataFrame, emp_col: str) -> pd.DataF
                     df.at[i, "Paycheck Amount"] = ""
                     df.at[i, "Paycheck Percentage"] = ""
 
-        # recompute priorities: partial_amt -> partial_pct -> full -> other
+        # Recompute priorities based on business rules:
+        # 1. Partial Amount (processed first)
+        # 2. Partial Percentage
+        # 3. Full / Remainder (processed last)
+        # 4. Other
         def _sort_key(i, orig_p):
             pkey = orig_p if not np.isnan(orig_p) else 1e18
             return (pkey, int(df.at[i, "_row_ord"]))
@@ -697,7 +726,15 @@ def build_payment_base_key(df: pd.DataFrame, emp_col: str):
     return df.apply(_row_key, axis=1)
 
 
+    return df.apply(_row_key, axis=1)
+
+
 def build_contact_base_key(df: pd.DataFrame, emp_col: str):
+    """
+    Constructs a unique key for comparing Emergency Contact records.
+    Key format: <EmployeeID>|<NormalizedName>|<PhoneLast10>|<NormalizedRelationship>
+    This key allows matching contacts even if they are listed in different orders.
+    """
     name_col = find_col(df.columns, "Contact Name", "NAME", "Name")
     phone_col = find_col(df.columns, "Mobile Phone", "Phone", "MOBILE PHONE")
     rel_col = find_col(df.columns, "Relationship Description", "Relationship")
@@ -849,6 +886,7 @@ def run_comparison(file_bytes: bytes) -> dict:
     g_uz_pay = group_indices(uzio_pay) if len(uzio_pay) else {}
     g_ad_pay = group_indices(adp_pay)
     g_uz_ec = group_indices(uzio_ec) if len(uzio_ec) else {}
+    g_uz_ec = group_indices(uzio_ec) if len(uzio_ec) else {}
     g_ad_ec = group_indices(adp_ec)
 
     def build_report_for_section(
@@ -861,6 +899,13 @@ def run_comparison(file_bytes: bytes) -> dict:
         emp_key_ad: str,
         mapping_df: pd.DataFrame,
     ) -> bytes:
+        """
+        Generates the comparison report for a specific section (Payment or Emergency Contact).
+        - Iterates through all unique record keys (union of UZIO and ADP keys).
+        - Aligns records based on the generated keys.
+        - Compares fields defined in the Mapping Sheet.
+        - Determines status: Data Match, Mismatch, Missing in UZIO/ADP, etc.
+        """
 
         sec_map = mapping_df.copy()
         sec_map = sec_map[sec_map["ADP_Resolved_Column"].map(norm_blank) != ""].copy()
